@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="fil">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bear-Light — DepEd MATATAG DLL Generator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Comfortaa:wght@500;700&family=Nunito:wght@400;600;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <header class="topbar no-print">
+    <div class="brand"><span class="brand-mark">B</span><h1>Bear-Light</h1><span class="brand-sub">DepEd MATATAG Lesson Log</span></div>
+    <button id="history-btn" type="button" class="btn btn-ghost">History (<span id="history-count">0</span>)</button>
+  </header>
+
+  <main class="wrap">
+    <section id="dll-form-container" class="card no-print">
+      <h2>Pormularyo ng Aralin</h2>
+      <div class="samples" id="samples"></div>
+      <form id="dll-form" novalidate>
+        <div class="grid4">
+          <label>Antas (Grade level) *<select id="gradeLevel"></select></label>
+          <label>Asignatura (Subject) *<select id="subjectArea"></select></label>
+          <label>Term<select id="quarter"><option>Term 1</option><option>Term 2</option><option>Term 3</option><option>Term 4</option></select></label>
+          <label>Week<select id="weekNumber"></select></label>
+        </div>
+        <label>Paksa / Competency *<textarea id="topic" rows="3" placeholder="Hal. Nauunawaan ang..."></textarea></label>
+        <label>Reference file (PDF, DOCX, PPTX, TXT — optional, max 20MB)<input type="file" id="refFile" accept=".pdf,.docx,.pptx,.txt,.md,.csv,.json"></label>
+        <p class="hint" id="refFileNote"></p>
+        <details>
+          <summary>Karagdagang detalye (school, teacher, atbp.)</summary>
+          <div class="grid2">
+            <label>Paaralan<input id="schoolName" placeholder="Pangalan ng paaralan"></label>
+            <label>Guro<input id="teacherName" placeholder="Pangalan ng guro"></label>
+            <label>Region<input id="region"></label>
+            <label>Division<input id="division"></label>
+            <label>Petsa ng pagtuturo<input id="teachingDates" placeholder="Hal. August 3 - 7, 2026"></label>
+            <label>Bilang ng sesyon<input id="noOfSessions" placeholder="Hal. 4 Sessions"></label>
+          </div>
+          <div class="grid2"><label>Logo 1 (kaliwa, hal. DepEd)<input type="file" id="leftLogo" accept="image/png,image/jpeg,image/gif"></label><label>Logo 2 (kanan, hal. paaralan)<input type="file" id="rightLogo" accept="image/png,image/jpeg,image/gif"></label></div>
+          <label>References<textarea id="references" rows="2"></textarea></label>
+          <label>Declaration of AI use<textarea id="declarationOfAiUse" rows="2"></textarea></label>
+        </details>
+        <p id="form-error" class="error" role="alert" hidden></p>
+        <button id="generate-btn" type="submit" class="btn btn-primary">Buuin ang DLL</button>
+      </form>
+    </section>
+
+    <section id="dll-output-container" class="card">
+      <div class="toolbar no-print">
+        <button id="edit-btn" type="button" class="btn btn-ghost">Edit</button>
+        <button id="copy-btn" type="button" class="btn btn-ghost">Copy text</button>
+        <button id="docx-btn" type="button" class="btn btn-ghost">Download DOCX</button>
+        <button id="print-btn" type="button" class="btn btn-ghost">Print / PDF</button>
+        <button id="save-btn" type="button" class="btn btn-primary">I-save sa History</button>
+      </div>
+      <div id="preview"></div>
+    </section>
+  </main>
+
+  <aside id="history-drawer" class="drawer no-print" hidden>
+    <div class="drawer-head"><strong>Saved History</strong><button id="history-close" type="button" class="btn btn-ghost">Close</button></div>
+    <input id="history-search" type="search" placeholder="Search grade or subject">
+    <ul id="history-list"></ul>
+    <button id="history-clear" type="button" class="btn btn-ghost danger">Clear all</button>
+  </aside>
+
+  <footer class="foot no-print">© 2026 Bear-Light · DepEd MATATAG Lesson Log Generator</footer>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

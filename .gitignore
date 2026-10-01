@@ -1,0 +1,21 @@
+@'
+# Secrets: never commit real keys
+.env*
+!.env.example
+
+# Python backend
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Old Next.js app (only matters on the legacy branch)
+node_modules/
+.next/
+dist/
+coverage/
+
+# Misc
+.DS_Store
+*.log
+'@ | Out-File -Encoding ascii .gitignore
