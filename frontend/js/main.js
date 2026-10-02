@@ -4,7 +4,7 @@ import { SAMPLE_DLL } from './data.js';
 import { initForm } from './form.js';
 import { generateDLL } from './api.js';
 import { render, getCurrent, toggleEdit, asPlainText } from './preview.js';
-import { exportDocx } from './api.js';
+import { exportDocx, getHealth } from './api.js';
 import { loadHistory, saveHistory, upsert } from './history.js';
 
 let saved = loadHistory();
@@ -20,9 +20,17 @@ function renderHistory() {
 
 function persist() { if (!saveHistory(saved)) alert('Puno na ang storage ng browser. Burahin ang ilang lumang DLL.'); renderHistory(); }
 
+async function refreshStatus() {
+  const h = await getHealth(), el = $('provider-status');
+  el.innerHTML = !h ? '' : Object.entries(h.providers).filter(([, v]) => v.status !== 'unconfigured').map(([n, v]) =>
+    `<span class="pchip" title="${esc(n)}: ${esc(v.status)}${v.flags.length ? ' (' + esc(v.flags.join(', ')) + ')' : ''}"><span class="dot dot-${esc(v.status)}" aria-hidden="true"></span>${esc(n)}<span class="sr-only"> ${esc(v.status)}</span></span>`).join('');
+}
+
 initForm(async (formData) => {
-  render(await generateDLL(formData));
-  $('dll-output-container').scrollIntoView({ behavior: 'smooth' });
+  try {
+    render(await generateDLL(formData));
+    $('dll-output-container').scrollIntoView({ behavior: 'smooth' });
+  } finally { refreshStatus(); }
 });
 
 $('edit-btn').onclick = toggleEdit;
@@ -45,3 +53,4 @@ $('history-list').onclick = (e) => {
 
 render(SAMPLE_DLL);
 renderHistory();
+refreshStatus();

@@ -1,5 +1,6 @@
 import { $, esc, getPath, setPath } from './utils.js';
 import { PROCEDURES, REFLECTION } from './data.js';
+import { checkCompliance } from './api.js';
 
 let current = null;
 let editing = false;
@@ -38,6 +39,7 @@ export function render(dll) {
     <h3>Remarks</h3><table>${row('Tala','remarks.notes')}</table>
     <h3>Reflection</h3><table>${REFLECTION.map(([k, label]) => row(label, `reflection.${k}`)).join('')}</table>`;
   setEditing(false);
+  showCompliance(dll.compliance);
 }
 
 function setEditing(on) {
@@ -46,9 +48,24 @@ function setEditing(on) {
   $('edit-btn').textContent = on ? 'Done editing' : 'Edit';
 }
 
+const LABEL = { pass: 'Kumpleto ang istruktura', review: 'May dapat suriin', fail: 'May kulang' };
+const TAG = { fail: 'Kulang', warn: 'Suriin' };
+
+// Flag panel on top of the DLL (hidden when printing) + highlight of the flagged rows.
+function showCompliance(c) {
+  if (!c) return;
+  const items = c.flags.map(f => `<li><span class="comp-tag comp-${f.level}">${TAG[f.level]}</span> <strong>${esc(f.section)}:</strong> ${esc(f.message)}</li>`).join('');
+  $('preview').insertAdjacentHTML('afterbegin', `<section class="compliance no-print" aria-label="Compliance check">
+    <p class="comp-head"><strong>Structure check:</strong> <span class="comp-badge comp-${c.status}">${LABEL[c.status]}</span> <span>${c.fail} kulang · ${c.warn} suriin</span></p>
+    ${items ? `<ul>${items}</ul>` : ''}<p class="comp-note">${esc(c.note)}</p></section>`);
+  c.flags.forEach(f => document.querySelector(`#preview [data-path="${f.path}"]`)?.closest('tr')?.classList.add('flag-' + f.level));
+}
+
 export function toggleEdit() {
-  if (editing) document.querySelectorAll('#preview [data-path]').forEach(el => setPath(current, el.dataset.path, el.innerText.trim()));
-  setEditing(!editing);
+  if (!editing) return setEditing(true);
+  document.querySelectorAll('#preview [data-path]').forEach(el => setPath(current, el.dataset.path, el.innerText.trim()));
+  setEditing(false);
+  checkCompliance(current).then(c => { if (c) { current.compliance = c; render(current); } });  // re-check after the teacher's edits
 }
 
 export function asPlainText() { return $('preview').innerText; }

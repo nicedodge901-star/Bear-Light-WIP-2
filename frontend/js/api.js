@@ -31,3 +31,14 @@ export async function exportDocx(dll) {
   const a = Object.assign(document.createElement('a'), { href: url, download: `${dll.title.replace(/[^\w-]+/g, '_')}.docx` });
   a.click(); URL.revokeObjectURL(url);
 }
+
+export async function getHealth() {
+  try { const r = await fetch(`${API_BASE}/api/health`); return r.ok ? await r.json() : null; } catch { return null; }
+}
+
+export async function checkCompliance(dll) {
+  try {
+    const r = await fetch(`${API_BASE}/api/check-compliance`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(dll) });
+    return r.ok ? await r.json() : null;
+  } catch { return null; }
+}

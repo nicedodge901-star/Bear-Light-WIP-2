@@ -68,3 +68,23 @@ summary{cursor:pointer;font-weight:800}
 
 #preview .logos{display:flex;justify-content:space-between;align-items:center;gap:12px}
 #preview .logos img{height:64px;width:auto}
+
+/* Provider status chips (top bar) */
+.provider-status{display:flex;flex-wrap:wrap;gap:8px;margin-left:auto;margin-right:12px}
+.pchip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;background:#243247;border:1px solid rgba(255,255,255,.35);border-radius:999px;font-size:.75rem;font-weight:600;color:#fff}
+.dot{width:9px;height:9px;border-radius:50%;background:#94A3B8}
+.dot-healthy{background:#4ADE80}.dot-degraded,.dot-rate_limited{background:#FBBF24}.dot-dead{background:#F87171}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+@media (max-width:640px){.provider-status{display:none}}
+
+/* Compliance flags */
+.compliance{margin:0 0 16px;padding:12px 14px;border:1px solid #D0D5DD;border-radius:10px;background:#F9FAFB;font-family:system-ui,sans-serif;font-size:.875rem;color:#1A2332}
+.compliance ul{margin:8px 0;padding-left:0;list-style:none;display:grid;gap:6px}
+.comp-head{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0}
+.comp-badge,.comp-tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.75rem;font-weight:700}
+.comp-pass{background:#D1FADF;color:#05603A}.comp-review,.comp-warn{background:#FEF0C7;color:#93370D}.comp-fail{background:#FEE4E2;color:#B42318}
+.comp-note{margin:8px 0 0;font-size:.75rem;color:#55657A}
+#preview tr.flag-fail th,#preview tr.flag-fail td{background:#FEF3F2}
+#preview tr.flag-warn th,#preview tr.flag-warn td{background:#FFFAEB}
+#preview tr.flag-fail th,#preview tr.flag-warn th{box-shadow:inset 4px 0 0 #D92D20}
+#preview tr.flag-warn th{box-shadow:inset 4px 0 0 #F79009}

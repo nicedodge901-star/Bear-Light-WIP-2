@@ -1,7 +1,8 @@
 """Bear-Light backend. Run: uvicorn main:app --reload --port 8000  (from backend/)
 Serves the API and the static frontend, so http://localhost:8000 is the whole app."""
 import base64, json, logging, os, re, time
-from datetime import date
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
+from compliance import check_dll
 from prompts import SYSTEM_PROMPT
 
 load_dotenv(Path(__file__).resolve().parent / ".env")  # always backend/.env, whatever folder uvicorn starts from
@@ -30,6 +32,7 @@ OPENAI_COMPAT = {  # name: (base_url, key env, model env, default model). Defaul
 GEMINI_DEFAULT_MODEL = "gemini-3.6-flash"
 TIER1, TIER2 = ["gemini", "mistral"], ["groq", "openrouter"]  # providers with no key in .env are skipped automatically
 TIMEOUT_SECONDS = 90
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "8000"))  # a full DLL is long; some free endpoints cut output short by default
 RATE_LIMIT_COOLDOWN, DEAD_COOLDOWN = 60, 600  # 429 -> 1 min; 401/403/404 (bad key / wrong model ID) -> 10 min
 cooldown_until: dict[str, float] = {}  # provider -> unix time when it may be tried again
 
@@ -69,7 +72,7 @@ def call_provider(name: str, system: str, user: str) -> tuple[dict, int]:
         return parse_json(r.text), (getattr(r.usage_metadata, "total_token_count", 0) or 0)
     base = OPENAI_COMPAT[name][0]
     r = OpenAI(base_url=base, api_key=key, timeout=TIMEOUT_SECONDS, max_retries=0).chat.completions.create(  # max_retries=0: OUR fallback handles failures
-        model=model_for(name), response_format={"type": "json_object"},
+        model=model_for(name), response_format={"type": "json_object"}, max_tokens=MAX_OUTPUT_TOKENS,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
     return parse_json(r.choices[0].message.content), (r.usage.total_tokens if r.usage else 0)
 
@@ -96,11 +99,109 @@ def provider_order(provider: str, task: str) -> list[str]:
     return ready + [p for p in seq if p not in ready]
 
 
+# ---------- provider health tracking + flags ----------
+STATS = {p: dict(calls=0, ok=0, fail=0, consecutive_failures=0, tokens=0, last_ok=None, last_error=None, last_error_at=None,
+                 last_error_kind=None, last_latency_ms=None, avg_latency_ms=None) for p in TIER1 + TIER2}
+LOG_FILE = Path(__file__).resolve().parent / "logs" / "calls.jsonl"  # one JSON line per provider call (benchmark data). Git-ignored.
+
+
+def redact(msg: str) -> str:
+    for p in TIER1 + TIER2:
+        if key_for(p): msg = msg.replace(key_for(p), "***")
+    return msg
+
+
+def error_kind(err: Exception) -> str:
+    if is_rate_limit(err): return "rate_limited"
+    return "auth_or_model" if status_of(err) in (401, 403, 404) else "other"
+
+
+def record(name: str, ok: bool, latency_ms: float, tokens: int = 0, err: Exception | None = None, fallback: bool = False):
+    s, now = STATS[name], datetime.now(timezone.utc).isoformat(timespec="seconds")
+    s["calls"] += 1; s["last_latency_ms"] = int(latency_ms)
+    if ok:
+        s["ok"] += 1; s["consecutive_failures"] = 0; s["last_ok"] = now; s["tokens"] += tokens
+        s["avg_latency_ms"] = int(((s["avg_latency_ms"] or 0) * (s["ok"] - 1) + latency_ms) / s["ok"])
+    else:
+        s["fail"] += 1; s["consecutive_failures"] += 1; s["last_error_at"] = now
+        s["last_error_kind"] = error_kind(err); s["last_error"] = redact(f"{type(err).__name__}: {err}")[:300]
+    try:  # logging must never break a request
+        LOG_FILE.parent.mkdir(exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": now, "provider": name, "model": model_for(name), "ok": ok, "latency_ms": int(latency_ms), "tokens": tokens,
+                                "http_status": None if ok else status_of(err), "error_kind": None if ok else s["last_error_kind"], "fallback": fallback}, default=str) + "\n")
+    except OSError: pass
+
+
+def provider_status(p: str) -> str:
+    """unconfigured | untested | healthy | degraded | rate_limited | dead"""
+    if not key_for(p): return "unconfigured"
+    s = STATS[p]
+    if cooldown_until.get(p, 0) > time.time():
+        return {"rate_limited": "rate_limited", "auth_or_model": "dead"}.get(s["last_error_kind"], "degraded")
+    if s["calls"] == 0: return "untested"
+    return "healthy" if s["consecutive_failures"] == 0 else "degraded"
+
+
+def flags_for(p: str) -> list[str]:
+    s, f = STATS[p], []
+    if not key_for(p): f.append("no_key")
+    elif s["calls"] == 0: f.append("never_tested")
+    if s["consecutive_failures"] >= 3: f.append("3_failures_in_a_row")
+    if s["consecutive_failures"] and s["last_error_kind"] == "auth_or_model": f.append("check_key_or_model_id")
+    if (s["avg_latency_ms"] or 0) > 30000: f.append("slow")
+    return f
+
+
+def debug_on() -> bool:
+    return os.getenv("DEBUG_ENDPOINTS") == "1"
+
+
 @app.get("/api/health")
 def health():
-    """Open http://localhost:8000/api/health to check which keys loaded and which models are set. Never returns keys."""
-    now = time.time()
-    return {"ok": True, "providers": {p: {"configured": bool(key_for(p)), "model": model_for(p), "cooldown_seconds": max(0, int(cooldown_until.get(p, 0) - now))} for p in TIER1 + TIER2}}
+    """Provider status for the UI dots. Never returns keys; error text only when DEBUG_ENDPOINTS=1."""
+    out = {p: {"status": provider_status(p), "flags": flags_for(p), "model": model_for(p), "cooldown_seconds": max(0, int(cooldown_until.get(p, 0) - time.time())), **STATS[p]} for p in TIER1 + TIER2}
+    if not debug_on():
+        for v in out.values(): v.pop("last_error")
+    live = [v for v in out.values() if v["status"] != "unconfigured"]
+    return {"ok": True, "all_active": bool(live) and all(v["status"] == "healthy" for v in live), "providers": out}
+
+
+@app.get("/api/debug/probe-all")
+def probe_all():
+    """Tiny real call to EVERY configured provider at once (cheap on free quotas). Needs DEBUG_ENDPOINTS=1."""
+    if not debug_on(): return JSONResponse({"error": "disabled"}, status_code=404)
+
+    def one(p):
+        t0 = time.time()
+        try:
+            _, tokens = call_provider(p, "Reply with JSON only.", 'Return exactly {"ok": true}')
+            record(p, True, (time.time() - t0) * 1000, tokens); cooldown_until.pop(p, None)
+            return p, {"ok": True, "latency_ms": int((time.time() - t0) * 1000)}
+        except Exception as e:
+            cd = cooldown_for(e)
+            if cd: cooldown_until[p] = time.time() + cd
+            record(p, False, (time.time() - t0) * 1000, err=e)
+            return p, {"ok": False, "error_kind": error_kind(e), "http_status": status_of(e), "error": redact(str(e))[:300]}
+    targets = [p for p in TIER1 + TIER2 if key_for(p)]
+    with ThreadPoolExecutor(max_workers=max(1, len(targets))) as ex: results = dict(ex.map(one, targets))
+    return {"all_active": bool(results) and all(r["ok"] for r in results.values()), "results": results}
+
+
+@app.get("/api/debug/provider/{name}")
+def debug_provider(name: str):
+    """Full DLL generation on ONE provider, no fallback. Shows truncation (missing_sections) and the real error. Needs DEBUG_ENDPOINTS=1."""
+    if not debug_on(): return JSONResponse({"error": "disabled"}, status_code=404)
+    if name not in TIER1 + TIER2: return JSONResponse({"error": "unknown provider"}, status_code=404)
+    req = GenerateRequest(gradeLevel="Grade 4 (MATATAG)", subjectArea="Science / Agham", quarter="Term 1", weekNumber="Week 1", topic="Physical and chemical changes in matter")
+    t0, base = time.time(), {"provider": name, "model": model_for(name)}
+    try:
+        parsed, tokens = call_provider(name, SYSTEM_PROMPT, build_user_prompt(req))
+        record(name, True, (time.time() - t0) * 1000, tokens)
+        return {**base, "ok": True, "latency_ms": int((time.time() - t0) * 1000), "tokens": tokens, "sections_returned": sorted(parsed.keys()), "missing_sections": [k for k in SECTIONS if k not in parsed]}
+    except Exception as e:
+        record(name, False, (time.time() - t0) * 1000, err=e)
+        return {**base, "ok": False, "latency_ms": int((time.time() - t0) * 1000), "error_type": type(e).__name__, "http_status": status_of(e), "error": redact(str(e))[:600]}
 
 
 # ---------- generate ----------
@@ -143,6 +244,8 @@ def build_dll(req: GenerateRequest, parsed: dict, provider: str, fallback: bool)
     dll["objectives"]["learningCompetencies"] = [str(c) for c in comps] if isinstance(comps, list) else [str(comps)]
     if not dll["content"]["topic"]: dll["content"]["topic"] = topic
     if req.attachedFile: dll["resources"]["attachedFileName"] = str(req.attachedFile.get("name", ""))[:200]
+    dll["compliance"] = check_dll(dll)
+    log.info("compliance status=%s fail=%d warn=%d provider=%s", dll["compliance"]["status"], dll["compliance"]["fail"], dll["compliance"]["warn"], provider)
     return dll
 
 
@@ -175,13 +278,21 @@ def generate(req: GenerateRequest):
         try:
             parsed, tokens = call_provider(p, SYSTEM_PROMPT, user)
             log.info("provider=%s model=%s ok latency_ms=%d tokens=%d fallback=%s", p, model_for(p), (time.time() - t0) * 1000, tokens, i > 0)
+            record(p, True, (time.time() - t0) * 1000, tokens, fallback=i > 0)
             return build_dll(req, parsed, p, i > 0)
         except Exception as e:
             cd = cooldown_for(e)
             if cd: cooldown_until[p] = time.time() + cd
+            record(p, False, (time.time() - t0) * 1000, err=e, fallback=i > 0)
             tried.append({"provider": p, "reason": "rate_limited" if is_rate_limit(e) else "error"})
             log.warning("provider=%s model=%s FAILED latency_ms=%d rate_limited=%s cooldown_s=%d err=%s", p, model_for(p), (time.time() - t0) * 1000, is_rate_limit(e), cd, str(e)[:200])
     return JSONResponse({"error": "Hindi maiproseso ang DLL ngayon dahil lahat ng AI provider ay hindi available o naabot ang limitasyon. Subukan muli mamaya.", "tried": tried}, status_code=503)
+
+
+@app.post("/api/check-compliance")
+def check_compliance(dll: dict):
+    """Re-run the structure check (the UI calls this after the teacher edits the DLL)."""
+    return check_dll(dll)
 
 
 # ---------- reference-file text extraction ----------
