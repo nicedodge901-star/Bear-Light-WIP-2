@@ -71,7 +71,7 @@ summary{cursor:pointer;font-weight:800}
 
 /* Provider status chips (top bar) */
 .provider-status{display:flex;flex-wrap:wrap;gap:8px;margin-left:auto;margin-right:12px}
-.pchip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;background:#243247;border:1px solid rgba(255,255,255,.35);border-radius:999px;font-size:.75rem;font-weight:600;color:#fff}
+.pchip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;background:#243247;border:1px solid rgba(255,255,255,.35);border-radius:999px;font-size:.75rem;font-weight:600;color:#fff}  /* dark chip: readable on cream OR navy headers */
 .dot{width:9px;height:9px;border-radius:50%;background:#94A3B8}
 .dot-healthy{background:#4ADE80}.dot-degraded,.dot-rate_limited{background:#FBBF24}.dot-dead{background:#F87171}
 .sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
@@ -88,3 +88,5 @@ summary{cursor:pointer;font-weight:800}
 #preview tr.flag-warn th,#preview tr.flag-warn td{background:#FFFAEB}
 #preview tr.flag-fail th,#preview tr.flag-warn th{box-shadow:inset 4px 0 0 #D92D20}
 #preview tr.flag-warn th{box-shadow:inset 4px 0 0 #F79009}
+.comp-quote{margin-top:2px;font-style:italic;color:#475467;font-size:.8125rem}
+.ai-review{margin-top:-4px}

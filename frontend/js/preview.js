@@ -40,6 +40,7 @@ export function render(dll) {
     <h3>Reflection</h3><table>${REFLECTION.map(([k, label]) => row(label, `reflection.${k}`)).join('')}</table>`;
   setEditing(false);
   showCompliance(dll.compliance);
+  if (dll.review) showReview(dll.review);
 }
 
 function setEditing(on) {
@@ -59,6 +60,20 @@ function showCompliance(c) {
     <p class="comp-head"><strong>Structure check:</strong> <span class="comp-badge comp-${c.status}">${LABEL[c.status]}</span> <span>${c.fail} kulang · ${c.warn} suriin</span></p>
     ${items ? `<ul>${items}</ul>` : ''}<p class="comp-note">${esc(c.note)}</p></section>`);
   c.flags.forEach(f => document.querySelector(`#preview [data-path="${f.path}"]`)?.closest('tr')?.classList.add('flag-' + f.level));
+}
+
+// AI review panel (advisory). Quotes the reviewer could not find in the DLL are labeled, never shown as hard failures.
+export function showReview(r) {
+  if (current) current.review = r;
+  $('preview').querySelector('.ai-review')?.remove();
+  const VERDICT = { ok: 'Walang nakitang problema', review: 'May dapat suriin', problems: 'May nakitang problema' };
+  const items = r.flags.map(f => `<li><span class="comp-tag comp-${f.level}">${TAG[f.level]}</span> <strong>${esc(f.section)}:</strong> ${esc(f.message)}
+    ${f.quote ? `<div class="comp-quote">"${esc(f.quote)}"${f.quote_verified ? '' : ' <em>(hindi makita ang sipi na ito sa DLL: mag-ingat)</em>'}</div>` : ''}</li>`).join('');
+  const html = `<section class="compliance ai-review no-print" aria-label="AI review">
+    <p class="comp-head"><strong>AI review (advisory):</strong> <span class="comp-badge comp-${r.verdict === 'ok' ? 'pass' : r.verdict === 'problems' ? 'fail' : 'review'}">${VERDICT[r.verdict]}</span> <span>${r.fail} kulang · ${r.warn} suriin</span></p>
+    ${items ? `<ul>${items}</ul>` : ''}<p class="comp-note">Binuo ng AI (${esc(r.model)}); maaaring magkamali. Basahin ang mismong teksto bago magdesisyon.</p></section>`;
+  const first = $('preview').querySelector('.compliance');
+  first ? first.insertAdjacentHTML('afterend', html) : $('preview').insertAdjacentHTML('afterbegin', html);
 }
 
 export function toggleEdit() {

@@ -42,3 +42,12 @@ export async function checkCompliance(dll) {
     return r.ok ? await r.json() : null;
   } catch { return null; }
 }
+
+export async function reviewDll(dll) {
+  let res;
+  try { res = await fetch(`${API_BASE}/api/review-dll`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(dll) }); }
+  catch { throw new Error('Hindi maabot ang backend.'); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Hindi gumana ang AI review.');
+  return data;
+}

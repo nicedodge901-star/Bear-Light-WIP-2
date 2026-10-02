@@ -15,6 +15,7 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from compliance import check_dll
+from review import REVIEW_PROMPT, flatten, normalize as normalize_review
 from prompts import SYSTEM_PROMPT
 
 load_dotenv(Path(__file__).resolve().parent / ".env")  # always backend/.env, whatever folder uvicorn starts from
@@ -27,10 +28,12 @@ app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["*"], a
 OPENAI_COMPAT = {  # name: (base_url, key env, model env, default model). Defaults are overridden by backend/.env
     "mistral": ("https://api.mistral.ai/v1", "MISTRAL_API_KEY", "MISTRAL_MODEL", "mistral-small-latest"),
     "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY", "GROQ_MODEL", "openai/gpt-oss-120b"),
+    "cloudflare": ("https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/ai/v1", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_MODEL", "@cf/openai/gpt-oss-120b"),
+    "failsafe": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "FAILSAFE_MODEL", ""),  # PAID model via your OpenRouter credit; off unless FAILSAFE_MODEL is set
     "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
 }
 GEMINI_DEFAULT_MODEL = "gemini-3.6-flash"
-TIER1, TIER2 = ["gemini", "mistral"], ["groq", "openrouter"]  # providers with no key in .env are skipped automatically
+TIER1, TIER2 = ["gemini", "mistral"], ["groq", "cloudflare", "openrouter", "failsafe"]  # providers with no key in .env are skipped automatically
 TIMEOUT_SECONDS = 90
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "8000"))  # a full DLL is long; some free endpoints cut output short by default
 RATE_LIMIT_COOLDOWN, DEAD_COOLDOWN = 60, 600  # 429 -> 1 min; 401/403/404 (bad key / wrong model ID) -> 10 min
@@ -38,6 +41,7 @@ cooldown_until: dict[str, float] = {}  # provider -> unix time when it may be tr
 
 
 def key_for(name: str) -> str:
+    if name == "failsafe" and not os.getenv("FAILSAFE_MODEL", "").strip(): return ""  # no model chosen = failsafe disabled
     return os.getenv("GEMINI_API_KEY" if name == "gemini" else OPENAI_COMPAT[name][1], "").strip()
 
 
@@ -59,7 +63,8 @@ def parse_json(text: str) -> dict:
     return out
 
 
-def call_provider(name: str, system: str, user: str) -> tuple[dict, int]:
+def call_provider(name: str, system: str, user: str, model: str | None = None, json_mode: bool = True,
+                  max_tokens: int | None = None, temperature: float | None = None) -> tuple[dict, int]:
     """Returns (parsed_json, total_tokens). Raises on failure."""
     key = key_for(name)
     if not key: raise RuntimeError(f"{name}: API key is missing")
@@ -70,11 +75,16 @@ def call_provider(name: str, system: str, user: str) -> tuple[dict, int]:
         r = client.models.generate_content(model=model_for(name), contents=user,
                                            config={"system_instruction": system, "response_mime_type": "application/json"})
         return parse_json(r.text), (getattr(r.usage_metadata, "total_token_count", 0) or 0)
-    base = OPENAI_COMPAT[name][0]
+    base = OPENAI_COMPAT[name][0].replace("{ACCOUNT}", os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip())
+    if "{ACCOUNT}" in OPENAI_COMPAT[name][0] and "//accounts//" in base.replace("/client/v4/", "//"): raise RuntimeError("CLOUDFLARE_ACCOUNT_ID is missing")
+    extra = {"response_format": {"type": "json_object"}} if json_mode else {}
+    if temperature is not None: extra["temperature"] = temperature
     r = OpenAI(base_url=base, api_key=key, timeout=TIMEOUT_SECONDS, max_retries=0).chat.completions.create(  # max_retries=0: OUR fallback handles failures
-        model=model_for(name), response_format={"type": "json_object"}, max_tokens=MAX_OUTPUT_TOKENS,
+        model=model or model_for(name), max_tokens=max_tokens or MAX_OUTPUT_TOKENS, **extra,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
-    return parse_json(r.choices[0].message.content), (r.usage.total_tokens if r.usage else 0)
+    content = r.choices[0].message.content
+    if not (content or "").strip(): raise ValueError("empty reply (a reasoning model may have used all its tokens: raise max_tokens)")
+    return parse_json(content), (r.usage.total_tokens if r.usage else 0)
 
 
 def status_of(err: Exception):
@@ -96,7 +106,8 @@ def provider_order(provider: str, task: str) -> list[str]:
     if provider != "auto" and provider in seq: seq = [provider] + [p for p in seq if p != provider]
     now = time.time()  # providers on cooldown go last instead of being hammered
     ready = [p for p in seq if cooldown_until.get(p, 0) <= now]
-    return ready + [p for p in seq if p not in ready]
+    out = ready + [p for p in seq if p not in ready]
+    return [p for p in out if p != "failsafe"] + [p for p in out if p == "failsafe"]  # the paid failsafe is ALWAYS last
 
 
 # ---------- provider health tracking + flags ----------
@@ -287,6 +298,22 @@ def generate(req: GenerateRequest):
             tried.append({"provider": p, "reason": "rate_limited" if is_rate_limit(e) else "error"})
             log.warning("provider=%s model=%s FAILED latency_ms=%d rate_limited=%s cooldown_s=%d err=%s", p, model_for(p), (time.time() - t0) * 1000, is_rate_limit(e), cd, str(e)[:200])
     return JSONResponse({"error": "Hindi maiproseso ang DLL ngayon dahil lahat ng AI provider ay hindi available o naabot ang limitasyon. Subukan muli mamaya.", "tried": tried}, status_code=503)
+
+
+@app.post("/api/review-dll")
+def review_dll(dll: dict):
+    """AI review (advisory). Reviewer = REVIEW_MODEL on OpenRouter (default: Apodex 1.1 Mini free). Quotes are verified against the DLL."""
+    if not key_for("openrouter"): return JSONResponse({"error": "Walang OPENROUTER_API_KEY sa backend/.env."}, status_code=503)
+    model, t0 = os.getenv("REVIEW_MODEL", "apodex/apodex-1.1-mini:free").strip(), time.time()
+    try:
+        parsed, tokens = call_provider("openrouter", REVIEW_PROMPT, "DLL to review:\n\n" + flatten(dll), model=model, json_mode=False, max_tokens=12000, temperature=0.2)
+    except Exception as e:
+        log.warning("review model=%s FAILED latency_ms=%d err=%s", model, (time.time() - t0) * 1000, redact(str(e))[:200])
+        msg = "Naabot ang limitasyon ng review model. Subukan muli mamaya." if is_rate_limit(e) else "Hindi gumana ang AI review ngayon."
+        return JSONResponse({"error": msg}, status_code=502)
+    out = normalize_review(parsed, dll); out.update(model=model, tokens=tokens, latency_ms=int((time.time() - t0) * 1000))
+    log.info("review model=%s ok latency_ms=%d tokens=%d verdict=%s flags=%d", model, out["latency_ms"], tokens, out["verdict"], len(out["flags"]))
+    return out
 
 
 @app.post("/api/check-compliance")

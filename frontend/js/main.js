@@ -3,8 +3,8 @@ import { $, esc } from './utils.js';
 import { SAMPLE_DLL } from './data.js';
 import { initForm } from './form.js';
 import { generateDLL } from './api.js';
-import { render, getCurrent, toggleEdit, asPlainText } from './preview.js';
-import { exportDocx, getHealth } from './api.js';
+import { render, getCurrent, toggleEdit, asPlainText, showReview } from './preview.js';
+import { exportDocx, getHealth, reviewDll } from './api.js';
 import { loadHistory, saveHistory, upsert } from './history.js';
 
 let saved = loadHistory();
@@ -35,6 +35,12 @@ initForm(async (formData) => {
 
 $('edit-btn').onclick = toggleEdit;
 $('docx-btn').onclick = async () => { const d = getCurrent(); if (!d) return; try { await exportDocx(d); } catch (e) { alert(e.message); } };
+$('review-btn').onclick = async () => {
+  const d = getCurrent(); if (!d) return;
+  const b = $('review-btn'); b.disabled = true; b.textContent = 'Sinusuri...';
+  try { showReview(await reviewDll(d)); } catch (e) { alert(e.message); }
+  finally { b.disabled = false; b.textContent = 'AI review'; }
+};
 $('print-btn').onclick = () => window.print();
 $('copy-btn').onclick = async () => { await navigator.clipboard.writeText(asPlainText()); $('copy-btn').textContent = 'Nakopya!'; setTimeout(() => ($('copy-btn').textContent = 'Copy text'), 1500); };
 // Logos are dropped from saved history: base64 would blow the ~5MB localStorage quota.
