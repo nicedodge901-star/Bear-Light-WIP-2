@@ -1,0 +1,596 @@
+"""Bear-Light backend. Run: uvicorn main:app --reload --port 8000  (from backend/)
+Serves the API and the static frontend, so http://localhost:8000 is the whole app."""
+import base64, json, logging, os, re, time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timezone
+from io import BytesIO
+from pathlib import Path
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from openai import OpenAI
+from pydantic import BaseModel, Field
+
+from compliance import check_dll
+from review import REVIEW_PROMPT, flatten, normalize as normalize_review
+from prompts import SYSTEM_PROMPT
+import pipeline
+
+load_dotenv(Path(__file__).resolve().parent / ".env")  # always backend/.env, whatever folder uvicorn starts from
+log = logging.getLogger("bear-light"); logging.basicConfig(level=logging.INFO)
+app = FastAPI()
+ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000,http://localhost:5500,http://127.0.0.1:5500").split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["*"], allow_headers=["*"])
+
+# ---------- providers ----------
+OPENAI_COMPAT = {  # name: (base_url, key env, model env, default model). Defaults are overridden by backend/.env
+    "mistral": ("https://api.mistral.ai/v1", "MISTRAL_API_KEY", "MISTRAL_MODEL", "mistral-small-latest"),
+    "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY", "GROQ_MODEL", "openai/gpt-oss-120b"),
+    "cloudflare": ("https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/ai/v1", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_MODEL", "@cf/openai/gpt-oss-120b"),
+    "failsafe": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "FAILSAFE_MODEL", ""),  # PAID model via your OpenRouter credit; off unless FAILSAFE_MODEL is set
+    "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
+}
+GEMINI_DEFAULT_MODEL = "gemini-3.6-flash"
+TIER1, TIER2 = ["gemini", "mistral"], ["groq", "cloudflare", "openrouter", "failsafe"]  # providers with no key in .env are skipped automatically
+TIMEOUT_SECONDS = 90
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "8000"))  # a full DLL is long; some free endpoints cut output short by default
+RATE_LIMIT_COOLDOWN, DEAD_COOLDOWN = 60, 600  # 429 -> 1 min; 401/403/404 (bad key / wrong model ID) -> 10 min
+cooldown_until: dict[str, float] = {}  # provider -> unix time when it may be tried again
+
+
+def key_for(name: str) -> str:
+    if name == "failsafe" and not os.getenv("FAILSAFE_MODEL", "").strip(): return ""  # no model chosen = failsafe disabled
+    return os.getenv("GEMINI_API_KEY" if name == "gemini" else OPENAI_COMPAT[name][1], "").strip()
+
+
+def model_for(name: str) -> str:
+    if name == "gemini": return os.getenv("GEMINI_MODEL", GEMINI_DEFAULT_MODEL)
+    return os.getenv(OPENAI_COMPAT[name][2], OPENAI_COMPAT[name][3])
+
+
+def parse_json(text: str) -> dict:
+    """Models sometimes wrap JSON in ``` fences or add chatter. Strip that, then require an object."""
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip())
+    try:
+        out = json.loads(t)
+    except json.JSONDecodeError:
+        a, b = t.find("{"), t.rfind("}")
+        if a == -1 or b <= a: raise ValueError("model did not return JSON")
+        out = json.loads(t[a:b + 1])
+    if not isinstance(out, dict): raise ValueError("model JSON is not an object")
+    return out
+
+
+def call_provider(name: str, system: str, user: str, model: str | None = None, json_mode: bool = True,
+                  max_tokens: int | None = None, temperature: float | None = None) -> tuple[dict, int]:
+    """Returns (parsed_json, total_tokens). Raises on failure."""
+    key = key_for(name)
+    if not key: raise RuntimeError(f"{name}: API key is missing")
+    if name == "gemini":
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=TIMEOUT_SECONDS * 1000))  # timeout is in ms
+        r = client.models.generate_content(model=model_for(name), contents=user,
+                                           config={"system_instruction": system, "response_mime_type": "application/json"})
+        return parse_json(r.text), (getattr(r.usage_metadata, "total_token_count", 0) or 0)
+    base = OPENAI_COMPAT[name][0].replace("{ACCOUNT}", os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip())
+    if "{ACCOUNT}" in OPENAI_COMPAT[name][0] and "//accounts//" in base.replace("/client/v4/", "//"): raise RuntimeError("CLOUDFLARE_ACCOUNT_ID is missing")
+    extra = {"response_format": {"type": "json_object"}} if json_mode else {}
+    if temperature is not None: extra["temperature"] = temperature
+    r = OpenAI(base_url=base, api_key=key, timeout=TIMEOUT_SECONDS, max_retries=0).chat.completions.create(  # max_retries=0: OUR fallback handles failures
+        model=model or model_for(name), max_tokens=max_tokens or MAX_OUTPUT_TOKENS, **extra,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
+    content = r.choices[0].message.content
+    if not (content or "").strip(): raise ValueError("empty reply (a reasoning model may have used all its tokens: raise max_tokens)")
+    return parse_json(content), (r.usage.total_tokens if r.usage else 0)
+
+
+def status_of(err: Exception):
+    return getattr(err, "status_code", None) or getattr(err, "code", None)  # openai SDK: status_code, google-genai: code
+
+
+def is_rate_limit(err: Exception) -> bool:
+    m = str(err).lower()
+    return status_of(err) == 429 or any(k in m for k in ("429", "rate limit", "quota", "resource_exhausted"))
+
+
+def cooldown_for(err: Exception) -> int:
+    if is_rate_limit(err): return RATE_LIMIT_COOLDOWN
+    return DEAD_COOLDOWN if status_of(err) in (401, 403, 404) else 0
+
+
+def provider_order(provider: str, task: str) -> list[str]:
+    seq = [p for p in ((TIER2 + TIER1) if task == "partial_edit" else (TIER1 + TIER2)) if key_for(p)]
+    if provider != "auto" and provider in seq: seq = [provider] + [p for p in seq if p != provider]
+    now = time.time()  # providers on cooldown go last instead of being hammered
+    ready = [p for p in seq if cooldown_until.get(p, 0) <= now]
+    out = ready + [p for p in seq if p not in ready]
+    return [p for p in out if p != "failsafe"] + [p for p in out if p == "failsafe"]  # the paid failsafe is ALWAYS last
+
+
+# ---------- provider health tracking + flags ----------
+STATS = {p: dict(calls=0, ok=0, fail=0, consecutive_failures=0, tokens=0, last_ok=None, last_error=None, last_error_at=None,
+                 last_error_kind=None, last_latency_ms=None, avg_latency_ms=None) for p in TIER1 + TIER2}
+LOG_FILE = Path(__file__).resolve().parent / "logs" / "calls.jsonl"  # one JSON line per provider call (benchmark data). Git-ignored.
+
+
+def redact(msg: str) -> str:
+    for p in TIER1 + TIER2:
+        if key_for(p): msg = msg.replace(key_for(p), "***")
+    return msg
+
+
+def error_kind(err: Exception) -> str:
+    if is_rate_limit(err): return "rate_limited"
+    return "auth_or_model" if status_of(err) in (401, 403, 404) else "other"
+
+
+def record(name: str, ok: bool, latency_ms: float, tokens: int = 0, err: Exception | None = None, fallback: bool = False):
+    s, now = STATS[name], datetime.now(timezone.utc).isoformat(timespec="seconds")
+    s["calls"] += 1; s["last_latency_ms"] = int(latency_ms)
+    if ok:
+        s["ok"] += 1; s["consecutive_failures"] = 0; s["last_ok"] = now; s["tokens"] += tokens
+        s["avg_latency_ms"] = int(((s["avg_latency_ms"] or 0) * (s["ok"] - 1) + latency_ms) / s["ok"])
+    else:
+        s["fail"] += 1; s["consecutive_failures"] += 1; s["last_error_at"] = now
+        s["last_error_kind"] = error_kind(err); s["last_error"] = redact(f"{type(err).__name__}: {err}")[:300]
+    try:  # logging must never break a request
+        LOG_FILE.parent.mkdir(exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": now, "provider": name, "model": model_for(name), "ok": ok, "latency_ms": int(latency_ms), "tokens": tokens,
+                                "http_status": None if ok else status_of(err), "error_kind": None if ok else s["last_error_kind"], "fallback": fallback}, default=str) + "\n")
+    except OSError: pass
+
+
+def provider_status(p: str) -> str:
+    """unconfigured | untested | healthy | degraded | rate_limited | dead"""
+    if not key_for(p): return "unconfigured"
+    s = STATS[p]
+    if cooldown_until.get(p, 0) > time.time():
+        return {"rate_limited": "rate_limited", "auth_or_model": "dead"}.get(s["last_error_kind"], "degraded")
+    if s["calls"] == 0: return "untested"
+    return "healthy" if s["consecutive_failures"] == 0 else "degraded"
+
+
+def flags_for(p: str) -> list[str]:
+    s, f = STATS[p], []
+    if not key_for(p): f.append("no_key")
+    elif s["calls"] == 0: f.append("never_tested")
+    if s["consecutive_failures"] >= 3: f.append("3_failures_in_a_row")
+    if s["consecutive_failures"] and s["last_error_kind"] == "auth_or_model": f.append("check_key_or_model_id")
+    if (s["avg_latency_ms"] or 0) > 30000: f.append("slow")
+    return f
+
+
+def debug_on() -> bool:
+    return os.getenv("DEBUG_ENDPOINTS") == "1"
+
+
+@app.get("/api/health")
+def health():
+    """Provider status for the UI dots. Never returns keys; error text only when DEBUG_ENDPOINTS=1."""
+    out = {p: {"status": provider_status(p), "flags": flags_for(p), "model": model_for(p), "cooldown_seconds": max(0, int(cooldown_until.get(p, 0) - time.time())), **STATS[p]} for p in TIER1 + TIER2}
+    if not debug_on():
+        for v in out.values(): v.pop("last_error")
+    live = [v for v in out.values() if v["status"] != "unconfigured"]
+    return {"ok": True, "all_active": bool(live) and all(v["status"] == "healthy" for v in live), "providers": out}
+
+
+@app.get("/api/debug/probe-all")
+def probe_all():
+    """Tiny real call to EVERY configured provider at once (cheap on free quotas). Needs DEBUG_ENDPOINTS=1."""
+    if not debug_on(): return JSONResponse({"error": "disabled"}, status_code=404)
+
+    def one(p):
+        t0 = time.time()
+        try:
+            _, tokens = call_provider(p, "Reply with JSON only.", 'Return exactly {"ok": true}')
+            record(p, True, (time.time() - t0) * 1000, tokens); cooldown_until.pop(p, None)
+            return p, {"ok": True, "latency_ms": int((time.time() - t0) * 1000)}
+        except Exception as e:
+            cd = cooldown_for(e)
+            if cd: cooldown_until[p] = time.time() + cd
+            record(p, False, (time.time() - t0) * 1000, err=e)
+            return p, {"ok": False, "error_kind": error_kind(e), "http_status": status_of(e), "error": redact(str(e))[:300]}
+    targets = [p for p in TIER1 + TIER2 if key_for(p)]
+    with ThreadPoolExecutor(max_workers=max(1, len(targets))) as ex: results = dict(ex.map(one, targets))
+    return {"all_active": bool(results) and all(r["ok"] for r in results.values()), "results": results}
+
+
+@app.get("/api/debug/provider/{name}")
+def debug_provider(name: str):
+    """Full DLL generation on ONE provider, no fallback. Shows truncation (missing_sections) and the real error. Needs DEBUG_ENDPOINTS=1."""
+    if not debug_on(): return JSONResponse({"error": "disabled"}, status_code=404)
+    if name not in TIER1 + TIER2: return JSONResponse({"error": "unknown provider"}, status_code=404)
+    req = GenerateRequest(gradeLevel="Grade 4 (MATATAG)", subjectArea="Science / Agham", quarter="Term 1", weekNumber="Week 1", topic="Physical and chemical changes in matter")
+    t0, base = time.time(), {"provider": name, "model": model_for(name)}
+    try:
+        parsed, tokens = call_provider(name, SYSTEM_PROMPT, build_user_prompt(req))
+        record(name, True, (time.time() - t0) * 1000, tokens)
+        return {**base, "ok": True, "latency_ms": int((time.time() - t0) * 1000), "tokens": tokens, "sections_returned": sorted(parsed.keys()), "missing_sections": [k for k in SECTIONS if k not in parsed]}
+    except Exception as e:
+        record(name, False, (time.time() - t0) * 1000, err=e)
+        return {**base, "ok": False, "latency_ms": int((time.time() - t0) * 1000), "error_type": type(e).__name__, "http_status": status_of(e), "error": redact(str(e))[:600]}
+
+
+# ---------- generate ----------
+def S(n: int = 300):
+    return Field("", max_length=n)
+
+
+class GenerateRequest(BaseModel):
+    gradeLevel: str = S(); subjectArea: str = S(); quarter: str = S(50); weekNumber: str = S(50); topic: str = S(3000)
+    provider: str = S(30); taskType: str = S(30)
+    schoolName: str = S(); teacherName: str = S(); region: str = S(); division: str = S(); teachingDates: str = S(); noOfSessions: str = S(100)
+    references: str = S(3000); declarationOfAiUse: str = S(3000)
+    leftLogoUrl: str = S(7_500_000); rightLogoUrl: str = S(7_500_000)  # base64 data URLs (5 MB images)
+    attachedFile: dict | None = None
+
+
+SECTIONS = {  # section -> keys that must exist (strings); missing ones are filled with ""
+    "objectives": ["contentStandard", "performanceStandard"], "content": ["topic", "subtopic", "integrationValues", "hotsSkills"],
+    "resources": ["teacherGuidePages", "learnerMaterialPages", "textbookPages", "additionalMaterials"],
+    "procedures": [f"{c}_{n}" for c, n in zip("abcdefghi", ["review", "purpose", "examples", "discussion", "mastery", "application", "generalization", "evaluation", "remediation"])],
+    "remarks": ["notes"], "reflection": ["learners80Percent", "learnersNeedingRemediation", "remediationEffective", "learnersContinuingRemediation", "effectiveTeachingStrategies", "difficultiesEncountered", "innovationsUsed"],
+}
+HEADER_FIELDS = ["schoolName", "teacherName", "gradeLevel", "quarter", "weekNumber", "division", "region", "teachingDates", "noOfSessions", "references", "declarationOfAiUse"]
+
+
+def build_dll(req: GenerateRequest, parsed: dict, provider: str, fallback: bool) -> dict:
+    # Header comes ONLY from what the teacher typed. Model-written header values are ignored, so a blank
+    # Teacher/School field stays blank instead of showing an invented name.
+    header = {k: getattr(req, k) for k in HEADER_FIELDS}
+    header.update(learningArea=req.subjectArea, leftLogoUrl=req.leftLogoUrl, rightLogoUrl=req.rightLogoUrl)
+    topic = req.topic.strip()
+    dll = {"id": f"dll-{int(time.time() * 1000)}", "title": f"{req.gradeLevel} {req.subjectArea} - {topic[:35]}{'...' if len(topic) > 35 else ''}",
+           "dateCreated": date.today().isoformat(), "providerUsed": provider, "tierUsed": "tier1" if provider in TIER1 else "tier2",
+           "fallbackOccurred": fallback, "header": header}
+    for sec, keys in SECTIONS.items():
+        got = parsed.get(sec) if isinstance(parsed.get(sec), dict) else {}
+        dll[sec] = {k: str(got.get(k, "") or "") for k in keys}
+    obj = parsed.get("objectives") if isinstance(parsed.get("objectives"), dict) else {}
+    comps = obj.get("learningCompetencies") or []
+    dll["objectives"]["learningCompetencies"] = [str(c) for c in comps] if isinstance(comps, list) else [str(comps)]
+    if not dll["content"]["topic"]: dll["content"]["topic"] = topic
+    if req.attachedFile: dll["resources"]["attachedFileName"] = str(req.attachedFile.get("name", ""))[:200]
+    dll["compliance"] = check_dll(dll)
+    log.info("compliance status=%s fail=%d warn=%d provider=%s", dll["compliance"]["status"], dll["compliance"]["fail"], dll["compliance"]["warn"], provider)
+    return dll
+
+
+def build_user_prompt(req: GenerateRequest) -> str:
+    lines = [f"- Grade Level: {req.gradeLevel}", f"- Subject / Learning Area: {req.subjectArea}", f"- Term: {req.quarter}",
+             f"- Week Number: {req.weekNumber}", f"- Topic / Competency Prompt: {req.topic}"]
+    if req.schoolName: lines.append(f"- School Name: {req.schoolName}")
+    if req.teacherName: lines.append(f"- Teacher Name: {req.teacherName}")
+    user = "Create a DepEd MATATAG Daily Lesson Log (DLL) for:\n" + "\n".join(lines)
+    user += "\n\nDo not invent school names, teacher names, dates, or competency codes. Use an empty string for any header field you were not given."
+    if req.attachedFile:
+        f = req.attachedFile
+        user += f"\n\nATTACHED REFERENCE DOCUMENT (Uploaded by Teacher):\nFilename: {str(f.get('name', ''))[:200]}"
+        if f.get("textContent"): user += f"\nExtracted File Snippet:\n\"\"\"{str(f['textContent'])[:8000]}\"\"\""
+        user += "\nPlease integrate relevant concepts, activity ideas, and references from this file into the procedures and resources."
+    return user
+
+
+@app.post("/api/generate-dll")
+def generate(req: GenerateRequest):
+    if not req.topic.strip():
+        return JSONResponse({"error": "Pakilagay ang paksa o competency."}, status_code=400)
+    order = provider_order(req.provider, req.taskType)
+    if not order:
+        log.error("No provider has an API key. Check backend/.env (open /api/health to see what loaded).")
+        return JSONResponse({"error": "Walang naka-set na AI provider. Ilagay ang API key sa backend/.env at i-restart ang server."}, status_code=503)
+    user, tried = build_user_prompt(req), []
+    for i, p in enumerate(order):
+        t0 = time.time()
+        try:
+            parsed, tokens = call_provider(p, SYSTEM_PROMPT, user)
+            log.info("provider=%s model=%s ok latency_ms=%d tokens=%d fallback=%s", p, model_for(p), (time.time() - t0) * 1000, tokens, i > 0)
+            record(p, True, (time.time() - t0) * 1000, tokens, fallback=i > 0)
+            return build_dll(req, parsed, p, i > 0)
+        except Exception as e:
+            cd = cooldown_for(e)
+            if cd: cooldown_until[p] = time.time() + cd
+            record(p, False, (time.time() - t0) * 1000, err=e, fallback=i > 0)
+            tried.append({"provider": p, "reason": "rate_limited" if is_rate_limit(e) else "error"})
+            log.warning("provider=%s model=%s FAILED latency_ms=%d rate_limited=%s cooldown_s=%d err=%s", p, model_for(p), (time.time() - t0) * 1000, is_rate_limit(e), cd, str(e)[:200])
+    return JSONResponse({"error": "Hindi maiproseso ang DLL ngayon dahil lahat ng AI provider ay hindi available o naabot ang limitasyon. Subukan muli mamaya.", "tried": tried}, status_code=503)
+
+
+@app.post("/api/review-dll")
+def review_dll(dll: dict):
+    """AI review (advisory). Reviewer = REVIEW_MODEL on OpenRouter (default: Apodex 1.1 Mini free). Quotes are verified against the DLL."""
+    if not key_for("openrouter"): return JSONResponse({"error": "Walang OPENROUTER_API_KEY sa backend/.env."}, status_code=503)
+    model, t0 = os.getenv("REVIEW_MODEL", "nvidia/nemotron-3.5-super-vl:free").strip(), time.time()
+    try:
+        parsed, tokens = call_provider("openrouter", REVIEW_PROMPT, "DLL to review:\n\n" + flatten(dll), model=model, json_mode=False, max_tokens=12000, temperature=0.2)
+    except Exception as e:
+        log.warning("review model=%s FAILED latency_ms=%d err=%s", model, (time.time() - t0) * 1000, redact(str(e))[:200])
+        msg = "Naabot ang limitasyon ng review model. Subukan muli mamaya." if is_rate_limit(e) else "Hindi gumana ang AI review ngayon."
+        return JSONResponse({"error": msg}, status_code=502)
+    out = normalize_review(parsed, dll); out.update(model=model, tokens=tokens, latency_ms=int((time.time() - t0) * 1000))
+    log.info("review model=%s ok latency_ms=%d tokens=%d verdict=%s flags=%d", model, out["latency_ms"], tokens, out["verdict"], len(out["flags"]))
+    return out
+
+
+@app.post("/api/check-compliance")
+def check_compliance(dll: dict):
+    """Re-run the structure check (the UI calls this after the teacher edits the DLL)."""
+    return check_dll(dll)
+
+# ---------- ILAW drafting pipeline (see pipeline.py) ----------
+def call_task(task: str, system: str, user: str) -> dict:
+    """task: 'logic' (Gemini first), 'grammar' (Mistral first), 'review' (OpenRouter REVIEW_MODEL). Falls back down the provider chain."""
+    if task == "review":
+        return call_provider("openrouter", system, user, model=os.getenv("REVIEW_MODEL", "nvidia/nemotron-3.5-super-vl:free").strip(),
+                             json_mode=False, max_tokens=12000, temperature=0.2)[0]
+    last = None
+    for i, p in enumerate(provider_order("mistral" if task == "grammar" else "auto", "")):
+        t0 = time.time()
+        try:
+            parsed, tokens = call_provider(p, system, user)
+            record(p, True, (time.time() - t0) * 1000, tokens, fallback=i > 0)
+            return parsed
+        except Exception as e:
+            cd = cooldown_for(e)
+            if cd: cooldown_until[p] = time.time() + cd
+            record(p, False, (time.time() - t0) * 1000, err=e, fallback=i > 0)
+            log.warning("task=%s provider=%s FAILED err=%s", task, p, redact(str(e))[:200]); last = e
+    raise RuntimeError("all providers failed") from last
+
+
+class ExtractReq(BaseModel):
+    moduleText: str = Field("", max_length=200_000)
+
+
+class DraftReq(BaseModel):
+    confirmed: dict = {}      # {"competencies": [...], "objectives": [...], "references": [...], "topic": [...]}  (teacher-confirmed)
+    answers: dict = {}        # {"intention": "...", "preLesson": "...", "flow": ["session 1", ...], "formative": "...", ...}
+    moduleText: str = Field("", max_length=200_000)
+    mode: str = "weekly" 
+
+
+def run_pipeline(fn, *args):
+    try: return fn(*args)
+    except ValueError as e: return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        log.warning("pipeline %s FAILED err=%s", fn.__name__, redact(str(e))[:200])
+        return JSONResponse({"error": "Hindi gumana ang AI ngayon. Subukan muli mamaya."}, status_code=502)
+
+
+@app.post("/api/extract-intentions")
+def extract_intentions(req: ExtractReq):
+    """Stage 1: pull competencies/objectives/topic/references from the module as VERIFIED verbatim quotes."""
+    return run_pipeline(pipeline.extract_intentions, req.moduleText, call_task)
+
+
+@app.post("/api/draft")
+def draft(req: DraftReq):
+    """Stages 2-4: organize teacher answers, grammar pass, deterministic check. Locked fields come only from `confirmed`."""
+    return run_pipeline(pipeline.build_draft, req.confirmed, req.answers, req.moduleText, call_task, req.mode)
+
+
+@app.post("/api/check-draft")
+def check_draft_ep(body: dict):
+    """Re-run the deterministic check after the teacher edits. Body: {"draft": {...}, "confirmed": {...}, "moduleText": ""}"""
+    try: conf = pipeline.make_conf(body.get("confirmed") or {}, str(body.get("mode") or "weekly"))
+    except ValueError as e: return JSONResponse({"error": str(e)}, status_code=400)
+    return pipeline.check_draft(body.get("draft") or {}, conf, str(body.get("moduleText") or ""))
+
+@app.post("/api/review-draft")
+def review_draft_ep(body: dict):
+    """Advisory AI review against the Learning Design Principles. Body: {"draft": {...}}"""
+    if not key_for("openrouter"): return JSONResponse({"error": "Walang OPENROUTER_API_KEY sa backend/.env."}, status_code=503)
+    return run_pipeline(pipeline.review_draft, body.get("draft") or {}, call_task)
+
+# ---------- reference-file text extraction ----------
+@app.post("/api/extract-text")
+async def extract_text(file: UploadFile = File(...)):
+    data = await file.read()
+    if len(data) > 20 * 1024 * 1024: return JSONResponse({"error": "Masyadong malaki ang file (max 20MB)."}, status_code=413)
+    name = (file.filename or "").lower()
+    try:
+        if name.endswith(".pdf"):
+            from pypdf import PdfReader
+            text = "\n".join((p.extract_text() or "") for p in PdfReader(BytesIO(data)).pages[:80])
+        elif name.endswith(".docx"):
+            from docx import Document
+            d = Document(BytesIO(data))
+            text = "\n".join([p.text for p in d.paragraphs] + [c.text for t in d.tables for r in t.rows for c in r.cells])  # include table cells
+        elif name.endswith(".pptx"):
+            from pptx import Presentation
+            text = "\n".join(sh.text_frame.text for s in Presentation(BytesIO(data)).slides for sh in s.shapes if sh.has_text_frame)
+        elif name.endswith((".txt", ".md", ".csv", ".json")):
+            text = data.decode("utf-8", errors="ignore")
+        else:
+            return JSONResponse({"error": "Hindi suportado ang file na ito (.doc/.ppt na luma). I-save bilang .docx/.pptx."}, status_code=415)
+    except Exception as e:
+        return JSONResponse({"error": f"Hindi mabasa ang file: {str(e)[:100]}"}, status_code=422)
+    return {"name": file.filename, "textContent": text.strip()[:60000]}
+
+
+# ---------- DOCX export (simplified layout: NOT identical to the original docx-export.ts) ----------
+# ---------- DOCX export (current ILAW draft structure) ----------
+@app.post("/api/export-docx")
+def export_docx(dll: dict):
+    from docx import Document
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.enum.section import WD_ORIENT
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    if not isinstance(dll, dict) or not isinstance(dll.get("header"), dict):
+        return JSONResponse(
+            {"error": "Walang valid na ILAW draft na ie-export."},
+            status_code=400
+        )
+
+    doc = Document()
+
+    section = doc.sections[0]
+    section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width, section.page_height = (
+        section.page_height,
+        section.page_width
+    )
+    section.top_margin = Inches(0.55)
+    section.bottom_margin = Inches(0.55)
+    section.left_margin = Inches(0.6)
+    section.right_margin = Inches(0.6)
+
+    normal = doc.styles["Normal"]
+    normal.font.name = "Arial"
+    normal.font.size = Pt(9)
+    normal.paragraph_format.space_after = Pt(3)
+
+    def value(section_name, field):
+        leaf = ((dll.get(section_name) or {}).get(field) or {})
+
+        if isinstance(leaf, dict):
+            if leaf.get("days") is not None:
+                return "\n".join(
+                    f"Day {i + 1}: {str(day or '')}"
+                    for i, day in enumerate(leaf.get("days") or [])
+                )
+
+            return str(leaf.get("text") or "")
+
+        return str(leaf or "")
+
+    def shade(cell, fill):
+        props = cell._tc.get_or_add_tcPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:fill"), fill)
+        props.append(shd)
+
+    def set_cell_text(cell, text, bold=False, color=None):
+        cell.text = ""
+
+        for i, line in enumerate(str(text or "").split("\n")):
+            p = cell.paragraphs[0] if i == 0 else cell.add_paragraph()
+            p.paragraph_format.space_after = Pt(2)
+
+            run = p.add_run(line)
+            run.bold = bold
+            run.font.name = "Arial"
+            run.font.size = Pt(9)
+
+            if color:
+                run.font.color.rgb = RGBColor(*color)
+
+        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+
+    def section_table(title, rows):
+        table = doc.add_table(rows=0, cols=2)
+        table.style = "Table Grid"
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.autofit = False
+
+        table.columns[0].width = Inches(2.25)
+        table.columns[1].width = Inches(7.55)
+
+        for label, content in rows:
+            cells = table.add_row().cells
+
+            cells[0].width = Inches(2.25)
+            cells[1].width = Inches(7.55)
+
+            set_cell_text(cells[0], label, bold=True)
+            set_cell_text(cells[1], content)
+
+            shade(cells[0], "F5EBE0")
+
+        band = doc.add_table(rows=1, cols=1)
+        band.style = "Table Grid"
+
+        set_cell_text(
+            band.cell(0, 0),
+            title,
+            bold=True,
+            color=(255, 255, 255)
+        )
+
+        shade(band.cell(0, 0), "C1622B")
+
+        band._tbl.addnext(table._tbl)
+
+    section_table("HEADER", [
+        ("Lesson Title", value("header", "lessonTitle")),
+        ("Learning Area/s", value("header", "learningArea")),
+        ("Name of Teacher/s", value("header", "teacherName")),
+        ("Grade Level and Section", value("header", "gradeSection")),
+        ("No. of Sessions", value("header", "noOfSessions")),
+        ("References", value("header", "references")),
+    ])
+
+    section_table("Intentions.", [
+        ("Learning Competency", value("intentions", "competencies")),
+        ("Curriculum Standards", value("intentions", "standards")),
+        ("Learning Objectives", value("intentions", "objectives")),
+        ("Learner Context", value("intentions", "learnerContext")),
+    ])
+
+    flow = []
+
+    for i, item in enumerate(
+        (dll.get("experience") or {}).get("flow") or []
+    ):
+        text = item.get("text", "") if isinstance(item, dict) else str(item)
+        flow.append(f"Sesyon {i + 1}: {text}")
+
+    section_table("Learning Experience.", [
+        ("Pre-Lesson", value("experience", "preLesson")),
+        ("Flow", "\n".join(flow)),
+        ("Learning Resources", value("experience", "learningResources")),
+        ("Opportunities for integration", value("experience", "integration")),
+    ])
+
+    section_table("Assessment.", [
+        ("Formative Assessment", value("assessment", "formative"))
+    ])
+
+    section_table("Ways Forward", [
+        ("Extended learning opportunities",
+         value("waysForward", "extendedLearning")),
+        ("Reflections", value("waysForward", "reflections")),
+    ])
+
+    prepared = doc.add_paragraph()
+    prepared.paragraph_format.space_before = Pt(10)
+
+    run = prepared.add_run(
+        "Prepared by: " + value("header", "teacherName")
+    )
+    run.bold = True
+    run.font.name = "Arial"
+    run.font.size = Pt(9)
+
+    buf = BytesIO()
+    doc.save(buf)
+
+    filename_base = (
+        re.sub(
+            r"[^A-Za-z0-9_-]+",
+            "-",
+            value("header", "lessonTitle")
+        ).strip("-")[:60] or "Lesson-Plan"
+    )
+
+    return Response(
+        buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Content-Disposition":
+            f'attachment; filename="Bear-Light-{filename_base}.docx"'
+        }
+    )
+# ---------- serve frontend (keep LAST) ----------
+FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
+
+if FRONTEND.exists():
+    app.mount("/", StaticFiles(directory=FRONTEND, html=True), name="frontend")

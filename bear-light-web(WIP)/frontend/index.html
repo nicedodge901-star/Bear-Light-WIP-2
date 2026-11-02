@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="fil">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bear-Light — ILAW Drafting Assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Comfortaa:wght@500;700&family=Nunito:wght@400;600;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <header class="topbar no-print">
+    <div class="brand"><span class="brand-mark">B</span><h1>Bear-Light</h1><span class="brand-sub">ILAW Drafting Assistant</span></div>
+    <div id="provider-status" class="provider-status" role="status" aria-label="Estado ng AI providers"></div>
+  </header>
+
+  <main class="wrap">
+    <ol id="stepper" class="stepper no-print" aria-label="Mga hakbang">
+      <li data-step="1" class="on">1. Module</li><li data-step="2">2. Kumpirmahin</li><li data-step="3">3. Mga sagot mo</li><li data-step="4">4. Draft</li>
+    </ol>
+
+    <!-- STEP 1 -->
+    <section id="step1" class="card no-print">
+      <h2>Module at pangunahing detalye</h2>
+      <p class="hint">Ang guro ang may-ari ng nilalaman. Kinukuha lang ng tool ang competency at objectives mula sa module mo, at inaayos ang mga sagot mo.</p>
+      <form id="form1" novalidate>
+        <label>Format
+          <select id="mode"><option value="weekly">Weekly (isang bloke para sa buong linggo)</option><option value="daily">Daily (Day 1 hanggang Day 5)</option></select>
+        </label>
+        <div class="grid2">
+          <label>Lesson Title<input id="lessonTitle"></label>
+          <label>Learning Area/s<input id="learningArea"></label>
+          <label>Name of Teacher/s<input id="teacherName"></label>
+          <label>Grade Level and Section<input id="gradeSection"></label>
+          <label>No. of Sessions<input id="noOfSessions" placeholder="Hal. 4"></label>
+        </div>
+        <label>Module / Instructional Material * (PDF, DOCX, PPTX, TXT — max 20MB)<input type="file" id="moduleFile" accept=".pdf,.docx,.pptx,.txt,.md"></label>
+        <p id="err1" class="error" role="alert" hidden></p>
+        <button id="read-btn" type="submit" class="btn btn-primary">Basahin ang module</button>
+      </form>
+    </section>
+
+    <!-- STEP 2 -->
+    <section id="step2" class="card no-print" hidden>
+      <h2>Kumpirmahin ang mula sa module</h2>
+      <p class="hint">Eksaktong sipi ito mula sa module mo. Hindi ito isinulat ng AI. Pumili lang ng gagamitin. Sa Daily, lagyan ng tsek ang araw kung saan ito gagamitin.</p>
+      <p id="dropped" class="hint"></p>
+      <div id="candidates"></div>
+      <label class="check"><input type="checkbox" id="confirmBox"> Binasa ko ang mga napili at kinukumpirma kong tama ang mga ito.</label>
+      <p id="err2" class="error" role="alert" hidden></p>
+      <div class="row-actions"><button id="back1-btn" type="button" class="btn btn-ghost">Bumalik</button><button id="to-answers-btn" type="button" class="btn btn-primary">Ituloy</button></div>
+    </section>
+
+    <!-- STEP 3 -->
+    <section id="step3" class="card no-print" hidden>
+      <h2>Mga sagot mo</h2>
+      <p class="hint">Ikaw ang sumulat ng nilalaman. Aayusin lang ng AI ang pagkakasunod, linaw, at balarila. Ang iniwang blangko ay mananatiling blangko.</p>
+      <form id="form3" novalidate>
+        <label>Pre-Lesson: paano mo ihahanda ang mga mag-aaral?<textarea id="preLesson" rows="3"></textarea></label>
+        <div>
+          <strong class="lbl">Flow: mga gawain bawat sesyon</strong>
+          <div id="flow-list"></div>
+          <button id="add-session-btn" type="button" class="btn btn-ghost">+ Magdagdag ng sesyon</button>
+        </div>
+        <label>Learning Resources<textarea id="learningResources" rows="2" placeholder="Isama ang alternatibo kung sakaling magkaproblema"></textarea></label>
+        <label>Opportunities for integration
+          <textarea id="integration" rows="2"></textarea></label>
+        <button id="na-btn" type="button" class="btn btn-ghost">Isulat ang N/A</button>
+        <label>Formative Assessment: gawain o tanong, paano hihingi ng tulong, at mga akomodasyon<textarea id="formative" rows="3"></textarea></label>
+        <label>Extended learning opportunities<textarea id="extendedLearning" rows="2"></textarea></label>
+        <label>Learner Context: obserbasyon mo sa mga mag-aaral (lakas, interes, hadlang)<textarea id="learnerContext" rows="3"></textarea></label>
+        <label>Reflections (opsyonal, isulat pagkatapos ng aralin)<textarea id="reflections" rows="2"></textarea></label>
+        <label>References (galing sa module; maaari mong baguhin)<textarea id="references" rows="2"></textarea></label>
+        <p id="err3" class="error" role="alert" hidden></p>
+        <div class="row-actions"><button id="back2-btn" type="button" class="btn btn-ghost">Bumalik</button><button id="draft-btn" type="submit" class="btn btn-primary">Ayusin at suriin ang draft</button></div>
+      </form>
+    </section>
+
+    <!-- STEP 4 -->
+    <section id="step4" class="card" hidden>
+      <div class="toolbar no-print">
+        <button id="back3-btn" type="button" class="btn btn-ghost">Bumalik sa mga sagot</button>
+        <button id="edit-btn" type="button" class="btn btn-ghost">Edit</button>
+        <button id="copy-btn" type="button" class="btn btn-ghost">Copy text</button>
+        <button id="review-btn" type="button" class="btn btn-ghost">AI review</button>
+        <button id="export-docx-btn" type="button" class="btn btn-primary">Export DOCX</button>
+        <button id="print-btn" type="button" class="btn btn-ghost">Print / PDF</button>
+      </div>
+      <p id="err4" class="error no-print" role="alert" hidden></p>
+      <div id="preview"></div>
+    </section>
+  </main>
+
+  <footer class="foot no-print">Bear-Light · Drafting assistant. Draft lang ito: kailangan ng review ng guro bago gamitin.</footer>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
