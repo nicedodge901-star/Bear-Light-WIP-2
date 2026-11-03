@@ -153,6 +153,19 @@ def provider_order(provider: str, task: str) -> list[str]:
     out = ready + [p for p in seq if p not in ready]
     return [p for p in out if p != "failsafe"] + [p for p in out if p == "failsafe"]  # the paid failsafe is ALWAYS last
 
+RETRY_STATUSES = (500, 502, 503, 504)
+
+
+def call_provider_retry(name, system, user, **kw):
+    """One short retry for temporary server errors (like Gemini's 'high demand' 503). Rate limits (429) and bad keys are NOT retried."""
+    try:
+        return call_provider(name, system, user, **kw)
+    except Exception as e:
+        if status_of(e) in RETRY_STATUSES or "unavailable" in str(e).lower():
+            log.info("provider=%s temporary error, retrying once in 2s", name)
+            time.sleep(2)
+            return call_provider(name, system, user, **kw)
+        raise
 
 # ---------- provider health tracking + flags ----------
 STATS = {p: dict(calls=0, ok=0, fail=0, consecutive_failures=0, tokens=0, last_ok=None, last_error=None, last_error_at=None,
@@ -375,7 +388,7 @@ def call_task(task: str, system: str, user: str) -> dict:
     for i, p in enumerate(provider_order("mistral" if task == "grammar" else "auto", "")):
         t0 = time.time()
         try:
-            parsed, tokens = call_provider(p, system, user)
+            parsed, tokens = call_provider_retry(p, system, user)
             record(p, True, (time.time() - t0) * 1000, tokens, fallback=i > 0)
             return parsed
         except Exception as e:
