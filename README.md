@@ -1,43 +1,90 @@
-# Bear-Light: ILAW Drafting Assistant
+# 🐻 Bear-Light: ILAW Drafting Assistant
 
-FastAPI backend + plain HTML/CSS/JS frontend (Mocha theme). No build step. One server serves both, so the whole app is one URL.
+A drafting assistant for DepEd teachers writing **ILAW lesson plans**. The teacher writes the lesson. The AI only reads the module, tidies the order and grammar, and a rule-based checker flags what's missing.
 
-## Run locally
+**Live app:** [YOUR-RENDER-URL](https://YOUR-RENDER-URL.onrender.com) *(free hosting: if it's asleep, wait about a minute for it to wake up)*
+
+![Bear-Light home page](docs/screenshot-home.png)
+
+## What it does
+
+1. **Header:** school, division, region, logos, teacher, grade and section.
+2. **Module:** upload a PDF, DOCX, PPTX or TXT.
+3. **Confirm:** the app pulls out the Learning Competency, Standards, Objectives and References as **exact quotes** from your module. You tick what to use. Quotes the AI can't find word-for-word in the module are thrown away.
+4. **Your answers:** you write the Pre-Lesson, session flow, assessment and the rest. Blank stays blank.
+5. **Draft:** the AI fixes order and grammar only. You can edit, run the structure check, ask for an AI review, then **export to Word** or print to PDF.
+
+![Draft preview](docs/screenshot-draft.png)
+
+## Why it's built this way
+
+- **The teacher owns the content.** Competencies, standards and objectives are locked to what the module actually says. The AI can't invent them.
+- **Rules live in code, not just prompts.** The AI can't add numbers, drop content or fill a blank answer. If it tries, your original text is kept.
+- **AI is advisory.** The structure check is deterministic. The AI review is a second opinion, and its quotes are verified against the draft.
+
+```mermaid
+flowchart LR
+    A[Upload module] --> B[Extract exact quotes]
+    B --> C{Teacher confirms}
+    C --> D[Teacher writes answers]
+    D --> E[AI organizes + grammar]
+    E --> F[Rule-based check]
+    F --> G[Edit / AI review]
+    G --> H[Export DOCX or PDF]
 ```
+
+## Privacy: read this before using it
+
+- The server **stores nothing**: no database, no accounts, and logs contain only provider names and timings.
+- But your text **is sent to third-party AI providers** (Gemini, Mistral, OpenRouter) to be processed. Free tiers may keep or use prompts.
+- **Never enter student names or personal information.**
+- Logos stay in your browser and go to the server only when you export the Word file. They're never sent to an AI.
+
+## Run it locally
+
+```powershell
 cd backend
-python -m venv .venv && .venv\Scripts\activate      # macOS/Linux: source .venv/bin/activate
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements-dev.txt
-copy .env.example .env                               # then paste your API keys into .env
-uvicorn main:app --reload --port 8000                # open http://localhost:8000
-python -m pytest -q                                  # 28 tests, no API keys needed
+copy .env.example .env      # then paste your API keys into .env
+uvicorn main:app --reload --port 8000
 ```
+
+Open http://localhost:8000. At least one provider key is needed. Run the tests (no keys needed) with `python -m pytest -q`.
 
 ## Deploy (Render, free)
-1. Push to GitHub (`.env` is git-ignored: check `git status` shows no `.env`).
-2. Render > New > Blueprint > pick the repo (uses `render.yaml`). Enter your API keys when asked.
-3. After it builds, open the URL. The provider chips under the title should turn green after the first request.
 
-Free tier notes: it sleeps after 15 minutes idle and takes about a minute to wake. Files on disk (`backend/logs`) are wiped on restart. Neither affects the app.
-Docker hosts: use the included `Dockerfile` (set the same env vars, default port 8000).
+1. Push to GitHub. Check that `git status` never shows `backend/.env`.
+2. In Render: **New → Blueprint**, pick this repo (it reads `render.yaml`).
+3. Enter your API keys when asked. They are never stored in git.
+4. After it's live, `/docs` and `/api/debug/probe-all` should both return Not Found.
 
-## Production checklist
-- `DEBUG_ENDPOINTS` must NOT be set. It opens `/docs`, raw provider errors and quota-burning probe endpoints.
-- Keys live only in the host's environment settings, never in git. If a key was ever pasted somewhere public, rotate it.
-- AI endpoints are rate limited (`RATE_LIMIT_PER_MIN` per IP, `RATE_LIMIT_GLOBAL_PER_MIN` for the whole site).
-- No login. Anyone with the URL can use your AI quota (within those limits). Share the link carefully.
+The free tier sleeps after 15 minutes idle and takes about a minute to wake. A Dockerfile is included for other hosts.
 
-## Who owns what
+## Security notes
+
+- Keys live only in the host's environment settings and in your local `backend/.env`.
+- `DEBUG_ENDPOINTS` must **never** be set in production.
+- AI endpoints are rate limited per IP and for the whole site. There is **no login**, so anyone with the link uses your AI quota. Share it carefully.
+- Rotate any key that was ever pasted somewhere public.
+
+## Tech
+
+FastAPI · plain HTML/CSS/JS (no build step) · python-docx for Word export · Mocha theme.
+
 | File | Job |
 |---|---|
 | `backend/main.py` | API, provider fallback, rate limit, DOCX export, serves the frontend |
-| `backend/pipeline.py` | Extract, organize, grammar, deterministic check (rules enforced in code) |
+| `backend/pipeline.py` | Extract → organize → grammar → check |
 | `backend/prompts.py` | AI prompts |
-| `frontend/index.html` | Page structure (4 cards + draft overlay) |
-| `frontend/css/styles.css` | All styling. Colors are variables at the top |
-| `frontend/js/wizard.js` | Cards 1-4 behavior and validation |
-| `frontend/js/logos.js` | Logo upload and shrinking (browser only) |
-| `frontend/js/preview.js` | Draft rendering, edit mode |
-| `frontend/js/api.js` | The ONLY place that calls the backend |
-| `frontend/js/main.js` | Wires everything together |
+| `frontend/index.html` | Page structure |
+| `frontend/css/styles.css` | All styling, colors at the top |
+| `frontend/js/api.js` | The only file that calls the backend |
+| `frontend/js/preview.js`, `wizard.js`, `logos.js`, `main.js` | Draft view, form steps, logo upload, wiring |
 
-`compliance.py`, `review.py` and the `/api/generate-dll` family are the old DLL generator. The ILAW UI does not use them.
+`compliance.py`, `review.py` and the `/api/generate-dll` endpoints are the old DLL generator and are not used by the ILAW screens.
+
+## Status
+
+Work in progress. A draft is a starting point: **the teacher must review it before use**. It does not check DepEd compliance or official approval.
