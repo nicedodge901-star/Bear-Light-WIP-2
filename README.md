@@ -4,8 +4,6 @@ A drafting assistant for DepEd teachers writing **ILAW lesson plans**. The teach
 
 **Live app:** [YOUR-RENDER-URL]((https://bear-light.onrender.com/)) *(free hosting: if it's asleep, wait about a minute for it to wake up)*
 
-![Bear-Light home page](docs/screenshot-home.png)
-
 ## What it does
 
 1. **Header:** school, division, region, logos, teacher, grade and section.
@@ -13,8 +11,6 @@ A drafting assistant for DepEd teachers writing **ILAW lesson plans**. The teach
 3. **Confirm:** the app pulls out the Learning Competency, Standards, Objectives and References as **exact quotes** from your module. You tick what to use. Quotes the AI can't find word-for-word in the module are thrown away.
 4. **Your answers:** you write the Pre-Lesson, session flow, assessment and the rest. Blank stays blank.
 5. **Draft:** the AI fixes order and grammar only. You can edit, run the structure check, ask for an AI review, then **export to Word** or print to PDF.
-
-![Draft preview](docs/screenshot-draft.png)
 
 ## Why it's built this way
 
