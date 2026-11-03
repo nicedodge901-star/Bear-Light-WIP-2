@@ -1,9 +1,10 @@
-fastapi
-uvicorn
-python-multipart
-python-dotenv
-openai
-google-genai
-pypdf
-python-docx
-python-pptx
+# Pinned to the versions the test suite and browser E2E passed on (Python 3.12).
+fastapi==0.162.0
+uvicorn==0.54.0
+python-multipart==0.0.33
+python-dotenv==1.2.4
+openai==3.42.1
+google-genai==2.34.0
+pypdf==6.21.4
+python-docx==1.2.0
+python-pptx==1.0.2

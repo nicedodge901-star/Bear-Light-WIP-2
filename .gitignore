@@ -1,4 +1,3 @@
-@'
 # Secrets: never commit real keys
 .env*
 !.env.example
@@ -8,14 +7,12 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.pytest_cache/
 
-# Old Next.js app (only matters on the legacy branch)
-node_modules/
-.next/
-dist/
-coverage/
+# Runtime logs (benchmark data, regenerated on every run)
+backend/logs/
+*.log
 
 # Misc
 .DS_Store
-*.log
-'@ | Out-File -Encoding ascii .gitignore
+node_modules/

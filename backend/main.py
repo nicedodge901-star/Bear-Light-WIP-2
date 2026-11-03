@@ -1,13 +1,14 @@
 """Bear-Light backend. Run: uvicorn main:app --reload --port 8000  (from backend/)
 Serves the API and the static frontend, so http://localhost:8000 is the whole app."""
 import base64, json, logging, os, re, time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -17,12 +18,55 @@ from pydantic import BaseModel, Field
 from compliance import check_dll
 from review import REVIEW_PROMPT, flatten, normalize as normalize_review
 from prompts import SYSTEM_PROMPT
+import pipeline
 
 load_dotenv(Path(__file__).resolve().parent / ".env")  # always backend/.env, whatever folder uvicorn starts from
 log = logging.getLogger("bear-light"); logging.basicConfig(level=logging.INFO)
-app = FastAPI()
+DEBUG = os.getenv("DEBUG_ENDPOINTS") == "1"  # dev only. Must be OFF in production (also exposes /docs and raw provider errors)
+app = FastAPI(docs_url="/docs" if DEBUG else None, redoc_url=None, openapi_url="/openapi.json" if DEBUG else None)
 ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000,http://localhost:5500,http://127.0.0.1:5500").split(",") if o.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["*"], allow_headers=["*"])  # production serves the page and API from ONE origin, so this only matters for local dev on :5500
+
+# ---------- abuse guard: size cap, rate limit on the endpoints that spend AI quota, security headers ----------
+MAX_BODY_BYTES = 30 * 1024 * 1024  # module uploads are capped at 20MB; the rest is JSON
+AI_PATHS = {"/api/extract-intentions", "/api/draft", "/api/review-draft", "/api/generate-dll", "/api/review-dll"}  # these burn free-tier quota
+RATE_PER_IP = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))           # per client IP, per minute. A whole school can share ONE public IP: raise it if teachers get blocked
+RATE_GLOBAL = int(os.getenv("RATE_LIMIT_GLOBAL_PER_MIN", "60"))     # whole site, per minute. Can't be dodged by faking headers, so your keys stay safe
+_ip_hits: dict[str, deque] = {}
+_all_hits: deque = deque()
+
+
+def client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")  # behind Render's proxy the real client is first. A courtesy limit, not a security boundary
+    return (fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "?")) or "?"
+
+
+def over_limit(ip: str, now: float) -> bool:
+    while _all_hits and _all_hits[0] <= now - 60: _all_hits.popleft()
+    hits = _ip_hits.setdefault(ip, deque())
+    while hits and hits[0] <= now - 60: hits.popleft()
+    if len(_ip_hits) > 5000:  # forget idle IPs so memory stays small
+        for k in [k for k, v in _ip_hits.items() if not v or v[-1] <= now - 60]: _ip_hits.pop(k, None)
+        _ip_hits.setdefault(ip, hits)
+    if len(hits) >= RATE_PER_IP or len(_all_hits) >= RATE_GLOBAL: return True
+    hits.append(now); _all_hits.append(now)
+    return False
+
+
+@app.middleware("http")
+async def guard(request: Request, call_next):
+    if request.method == "POST" and request.url.path.startswith("/api/"):
+        cl = request.headers.get("content-length", "")
+        if cl.isdigit() and int(cl) > MAX_BODY_BYTES:
+            return JSONResponse({"error": "Masyadong malaki ang ipinadala."}, status_code=413)
+        if request.url.path in AI_PATHS and over_limit(client_ip(request), time.time()):
+            return JSONResponse({"error": "Masyadong maraming request. Maghintay ng isang minuto at subukan muli."}, status_code=429, headers={"Retry-After": "60"})
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "same-origin")
+    return resp
+
 
 # ---------- providers ----------
 OPENAI_COMPAT = {  # name: (base_url, key env, model env, default model). Defaults are overridden by backend/.env
@@ -165,7 +209,7 @@ def flags_for(p: str) -> list[str]:
 
 
 def debug_on() -> bool:
-    return os.getenv("DEBUG_ENDPOINTS") == "1"
+    return DEBUG
 
 
 @app.get("/api/health")
@@ -302,9 +346,9 @@ def generate(req: GenerateRequest):
 
 @app.post("/api/review-dll")
 def review_dll(dll: dict):
-    """AI review (advisory). Reviewer = REVIEW_MODEL on OpenRouter (default: Apodex 1.1 Mini free). Quotes are verified against the DLL."""
+    """AI review (advisory). Reviewer = REVIEW_MODEL on OpenRouter (default: NVIDIA Nemotron free). Quotes are verified against the DLL."""
     if not key_for("openrouter"): return JSONResponse({"error": "Walang OPENROUTER_API_KEY sa backend/.env."}, status_code=503)
-    model, t0 = os.getenv("REVIEW_MODEL", "apodex/apodex-1.1-mini:free").strip(), time.time()
+    model, t0 = os.getenv("REVIEW_MODEL", "nvidia/nemotron-3.5-super-vl:free").strip(), time.time()
     try:
         parsed, tokens = call_provider("openrouter", REVIEW_PROMPT, "DLL to review:\n\n" + flatten(dll), model=model, json_mode=False, max_tokens=12000, temperature=0.2)
     except Exception as e:
@@ -321,6 +365,70 @@ def check_compliance(dll: dict):
     """Re-run the structure check (the UI calls this after the teacher edits the DLL)."""
     return check_dll(dll)
 
+# ---------- ILAW drafting pipeline (see pipeline.py) ----------
+def call_task(task: str, system: str, user: str) -> dict:
+    """task: 'logic' (Gemini first), 'grammar' (Mistral first), 'review' (OpenRouter REVIEW_MODEL). Falls back down the provider chain."""
+    if task == "review":
+        return call_provider("openrouter", system, user, model=os.getenv("REVIEW_MODEL", "nvidia/nemotron-3.5-super-vl:free").strip(),
+                             json_mode=False, max_tokens=12000, temperature=0.2)[0]
+    last = None
+    for i, p in enumerate(provider_order("mistral" if task == "grammar" else "auto", "")):
+        t0 = time.time()
+        try:
+            parsed, tokens = call_provider(p, system, user)
+            record(p, True, (time.time() - t0) * 1000, tokens, fallback=i > 0)
+            return parsed
+        except Exception as e:
+            cd = cooldown_for(e)
+            if cd: cooldown_until[p] = time.time() + cd
+            record(p, False, (time.time() - t0) * 1000, err=e, fallback=i > 0)
+            log.warning("task=%s provider=%s FAILED err=%s", task, p, redact(str(e))[:200]); last = e
+    raise RuntimeError("all providers failed") from last
+
+
+class ExtractReq(BaseModel):
+    moduleText: str = Field("", max_length=200_000)
+
+
+class DraftReq(BaseModel):
+    confirmed: dict = {}      # {"competencies": [...], "objectives": [...], "references": [...], "topic": [...]}  (teacher-confirmed)
+    answers: dict = {}        # {"intention": "...", "preLesson": "...", "flow": ["session 1", ...], "formative": "...", ...}
+    moduleText: str = Field("", max_length=200_000)
+    mode: str = "weekly" 
+
+
+def run_pipeline(fn, *args):
+    try: return fn(*args)
+    except ValueError as e: return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        log.warning("pipeline %s FAILED err=%s", fn.__name__, redact(str(e))[:200])
+        return JSONResponse({"error": "Hindi gumana ang AI ngayon. Subukan muli mamaya."}, status_code=502)
+
+
+@app.post("/api/extract-intentions")
+def extract_intentions(req: ExtractReq):
+    """Stage 1: pull competencies/objectives/topic/references from the module as VERIFIED verbatim quotes."""
+    return run_pipeline(pipeline.extract_intentions, req.moduleText, call_task)
+
+
+@app.post("/api/draft")
+def draft(req: DraftReq):
+    """Stages 2-4: organize teacher answers, grammar pass, deterministic check. Locked fields come only from `confirmed`."""
+    return run_pipeline(pipeline.build_draft, req.confirmed, req.answers, req.moduleText, call_task, req.mode)
+
+
+@app.post("/api/check-draft")
+def check_draft_ep(body: dict):
+    """Re-run the deterministic check after the teacher edits. Body: {"draft": {...}, "confirmed": {...}, "moduleText": ""}"""
+    try: conf = pipeline.make_conf(body.get("confirmed") or {}, str(body.get("mode") or "weekly"))
+    except ValueError as e: return JSONResponse({"error": str(e)}, status_code=400)
+    return pipeline.check_draft(body.get("draft") or {}, conf, str(body.get("moduleText") or ""))
+
+@app.post("/api/review-draft")
+def review_draft_ep(body: dict):
+    """Advisory AI review against the Learning Design Principles. Body: {"draft": {...}}"""
+    if not key_for("openrouter"): return JSONResponse({"error": "Walang OPENROUTER_API_KEY sa backend/.env."}, status_code=503)
+    return run_pipeline(pipeline.review_draft, body.get("draft") or {}, call_task)
 
 # ---------- reference-file text extraction ----------
 @app.post("/api/extract-text")
@@ -331,7 +439,7 @@ async def extract_text(file: UploadFile = File(...)):
     try:
         if name.endswith(".pdf"):
             from pypdf import PdfReader
-            text = "\n".join((p.extract_text() or "") for p in PdfReader(BytesIO(data)).pages[:30])
+            text = "\n".join((p.extract_text() or "") for p in PdfReader(BytesIO(data)).pages[:80])
         elif name.endswith(".docx"):
             from docx import Document
             d = Document(BytesIO(data))
@@ -345,38 +453,181 @@ async def extract_text(file: UploadFile = File(...)):
             return JSONResponse({"error": "Hindi suportado ang file na ito (.doc/.ppt na luma). I-save bilang .docx/.pptx."}, status_code=415)
     except Exception as e:
         return JSONResponse({"error": f"Hindi mabasa ang file: {str(e)[:100]}"}, status_code=422)
-    return {"name": file.filename, "textContent": text.strip()[:8000]}
+    return {"name": file.filename, "textContent": text.strip()[:60000]}
 
 
-# ---------- DOCX export (simplified layout: NOT identical to the original docx-export.ts) ----------
+# ---------- DOCX export (ILAW draft: letterhead + HEADER, Intentions, Learning Experience, Assessment, Ways Forward) ----------
+LOGO_RE = re.compile(r"^data:image/(?:png|jpeg);base64,([A-Za-z0-9+/=]+)$")
+
+
+def logo_bytes(url) -> bytes | None:
+    """Logos arrive from the browser as small PNG/JPEG data URLs. Anything else is silently skipped, never an error."""
+    m = LOGO_RE.match(str(url or "").strip())
+    if not m or len(m.group(1)) > 3_000_000: return None
+    try: return base64.b64decode(m.group(1), validate=True)
+    except Exception: return None
+
+
 @app.post("/api/export-docx")
 def export_docx(dll: dict):
     from docx import Document
-    from docx.shared import Inches
-    doc = Document(); h = dll.get("header") or {}
-    for key in ("leftLogoUrl", "rightLogoUrl"):
-        m = re.match(r"data:image/\w+;base64,(.+)", h.get(key) or "")
-        if m:
-            try: doc.add_picture(BytesIO(base64.b64decode(m.group(1))), width=Inches(0.9))
-            except Exception: pass  # skip unsupported image types (e.g. svg/webp)
-    doc.add_heading("Daily Lesson Log", 0)
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.enum.section import WD_ORIENT
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
 
-    def table(title, rows):
-        doc.add_heading(title, 2); t = doc.add_table(rows=0, cols=2); t.style = "Table Grid"
-        for label, val in rows:
-            c = t.add_row().cells; c[0].text, c[1].text = label, str(val or "")
-    table("Header", [("Paaralan", h.get("schoolName")), ("Guro", h.get("teacherName")), ("Antas", h.get("gradeLevel")), ("Asignatura", h.get("learningArea")),
-                     ("Term / Week", f"{h.get('quarter', '')} / {h.get('weekNumber', '')}"), ("Petsa", h.get("teachingDates")), ("Division", h.get("division")),
-                     ("Region", h.get("region")), ("Sesyon", h.get("noOfSessions")), ("References", h.get("references")), ("Declaration of AI use", h.get("declarationOfAiUse"))])
-    o = dll.get("objectives") or {}
-    table("Intentions", [("Content Standard", o.get("contentStandard")), ("Performance Standard", o.get("performanceStandard")),
-                         ("Learning Competencies", "\n".join(str(c) for c in (o.get("learningCompetencies") or [])))])
-    for sec, title in [("content", "Nilalaman"), ("resources", "Learning Resources"), ("procedures", "Learning Experience"), ("remarks", "Remarks"), ("reflection", "Reflection")]:
-        table(title, list((dll.get(sec) or {}).items()))
-    buf = BytesIO(); doc.save(buf)
-    return Response(buf.getvalue(), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    headers={"Content-Disposition": 'attachment; filename="Bear-Light-DLL.docx"'})
+    if not isinstance(dll, dict) or not isinstance(dll.get("header"), dict):
+        return JSONResponse({"error": "Walang valid na ILAW draft na ie-export."}, status_code=400)
+
+    doc = Document()
+    section = doc.sections[0]
+    section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width, section.page_height = section.page_height, section.page_width
+    section.top_margin = section.bottom_margin = Inches(0.55)
+    section.left_margin = section.right_margin = Inches(0.6)
+
+    normal = doc.styles["Normal"]
+    normal.font.name = "Times New Roman"
+    normal.font.size = Pt(12)
+    normal.paragraph_format.space_after = Pt(3)
+
+    def value(section_name, field):
+        leaf = ((dll.get(section_name) or {}).get(field) or {})
+        if isinstance(leaf, dict):
+            if leaf.get("days") is not None:
+                return "\n".join(f"Day {i + 1}: {str(day or '')}" for i, day in enumerate(leaf.get("days") or []))
+            return str(leaf.get("text") or "")
+        return str(leaf or "")
+
+    def shade(cell, fill):
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:fill"), fill)
+        cell._tc.get_or_add_tcPr().append(shd)
+
+    def set_cell_text(cell, text, bold=False, color=None):
+        cell.text = ""
+        for i, line in enumerate(str(text or "").split("\n")):
+            p = cell.paragraphs[0] if i == 0 else cell.add_paragraph()
+            p.paragraph_format.space_after = Pt(2)
+            run = p.add_run(line)
+            run.bold = bold
+            run.font.name = "Times New Roman"
+            run.font.size = Pt(12)
+            if color: run.font.color.rgb = RGBColor(*color)
+        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+
+    def letterhead():
+        """Logos left/right, DepEd lines in the middle. Skipped entirely when the teacher gave no logos, school, division or region."""
+        logos = dll.get("logos") if isinstance(dll.get("logos"), dict) else {}
+        left, right = logo_bytes(logos.get("left")), logo_bytes(logos.get("right"))
+        school, division, region = (value("header", k).strip() for k in ("schoolName", "division", "region"))
+        if not (left or right or school or division or region): return
+        table = doc.add_table(rows=1, cols=3)  # default table style has no borders
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.autofit = False
+        for i, w in enumerate((Inches(1.3), Inches(5.0), Inches(1.3))):
+            table.columns[i].width = w
+            table.rows[0].cells[i].width = w
+        cells = table.rows[0].cells
+        for cell, data, align in ((cells[0], left, WD_ALIGN_PARAGRAPH.RIGHT), (cells[2], right, WD_ALIGN_PARAGRAPH.LEFT)):
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            cell.paragraphs[0].alignment = align
+            if data:
+                try: cell.paragraphs[0].add_run().add_picture(BytesIO(data), height=Inches(0.8))
+                except Exception: log.warning("logo skipped: image could not be read")
+        mid = cells[1]
+        mid.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+        lines = [("Republic of the Philippines", False, 9), ("Department of Education", True, 10), (region, False, 9), (division, False, 9), (school, True, 11)]
+        first = True
+        for text, bold, size in lines:
+            if not text: continue
+            p = mid.paragraphs[0] if first else mid.add_paragraph()
+            first = False
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.paragraph_format.space_after = Pt(0)
+            run = p.add_run(text)
+            run.bold, run.font.name, run.font.size = bold, "Times New Roman", Pt(12)
+            doc.add_paragraph().paragraph_format.space_after = Pt(2)  # keeps Word from merging the letterhead with the next table
+
+    def section_table(title, rows):
+        table = doc.add_table(rows=0, cols=2)
+        table.style = "Table Grid"
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.autofit = False
+        table.columns[0].width = Inches(2.25)
+        table.columns[1].width = Inches(7.55)
+        for label, content in rows:
+            cells = table.add_row().cells
+            cells[0].width = Inches(2.25)
+            cells[1].width = Inches(7.55)
+            set_cell_text(cells[0], label, bold=True)
+            set_cell_text(cells[1], content)
+        if not title:   # no band for this section (used by HEADER)
+            return
+        band = doc.add_table(rows=1, cols=1)
+        band.style = "Table Grid"
+        set_cell_text(band.cell(0, 0), title, bold=True, color=(0, 0, 0))
+        shade(band.cell(0, 0), "D9D9D9")
+        band._tbl.addnext(table._tbl)
+
+    letterhead()
+
+    header_rows = [
+        ("Lesson Title", value("header", "lessonTitle")),
+        ("Learning Area/s", value("header", "learningArea")),
+        ("Name of Teacher/s", value("header", "teacherName")),
+        ("Grade Level and Section", value("header", "gradeSection")),
+        ("No. of Sessions", value("header", "noOfSessions")),
+    ]
+    if value("header", "teachingDates").strip(): header_rows.append(("Teaching Dates", value("header", "teachingDates")))
+    header_rows.append(("References", value("header", "references")))
+    section_table(None, header_rows)
+
+    section_table("Intentions.", [
+        ("Learning Competency", value("intentions", "competencies")),
+        ("Curriculum Standards", value("intentions", "standards")),
+        ("Learning Objectives", value("intentions", "objectives")),
+        ("Learner Context", value("intentions", "learnerContext")),
+    ])
+
+    flow = []
+    for i, item in enumerate((dll.get("experience") or {}).get("flow") or []):
+        text = item.get("text", "") if isinstance(item, dict) else str(item)
+        flow.append(f"Sesyon {i + 1}: {text}")
+
+    section_table("Learning Experience.", [
+        ("Pre-Lesson", value("experience", "preLesson")),
+        ("Flow", "\n".join(flow)),
+        ("Learning Resources", value("experience", "learningResources")),
+        ("Opportunities for integration", value("experience", "integration")),
+    ])
+    section_table("Assessment.", [("Formative Assessment", value("assessment", "formative"))])
+    section_table("Ways Forward", [
+        ("Extended learning opportunities", value("waysForward", "extendedLearning")),
+        ("Reflections", value("waysForward", "reflections")),
+    ])
+
+    prepared = doc.add_paragraph()
+    prepared.paragraph_format.space_before = Pt(10)
+    run = prepared.add_run("Prepared by: " + value("header", "teacherName"))
+    run.bold = True
+    run.font.name = "Times New Roman"
+    run.font.size = Pt(12)
+
+    buf = BytesIO()
+    doc.save(buf)
+    filename_base = re.sub(r"[^A-Za-z0-9_-]+", "-", value("header", "lessonTitle")).strip("-")[:60] or "Lesson-Plan"
+    return Response(
+        buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="Bear-Light-{filename_base}.docx"'},
+    )
 
 
+# ---------- serve frontend (keep LAST) ----------
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
-if FRONTEND.exists(): app.mount("/", StaticFiles(directory=FRONTEND, html=True), name="frontend")  # keep LAST
+
+if FRONTEND.exists():
+    app.mount("/", StaticFiles(directory=FRONTEND, html=True), name="frontend")

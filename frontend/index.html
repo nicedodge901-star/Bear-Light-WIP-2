@@ -3,72 +3,152 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Bear-Light — DepEd MATATAG DLL Generator</title>
+  <meta name="theme-color" content="#543428">
+  <title>Bear-Light — ILAW Drafting Assistant</title>
+  <meta name="description" content="Drafting assistant para sa ILAW Lesson Plan. Ang guro ang sumusulat; inaayos lang ng AI ang pagkakasunod at balarila.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='32' fill='%23684231'/%3E%3Ctext x='32' y='43' font-size='34' font-family='sans-serif' font-weight='700' text-anchor='middle' fill='%23fbf4ea'%3EB%3C/text%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Comfortaa:wght@500;700&family=Nunito:wght@400;600;800&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@500;600;700&family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="css/styles.css">
 </head>
 <body>
-  <header class="topbar no-print">
-    <div class="brand"><span class="brand-mark">B</span><h1>Bear-Light</h1><span class="brand-sub">DepEd MATATAG Lesson Log</span></div>
-    <div id="provider-status" class="provider-status" role="status" aria-label="Estado ng AI providers"></div>
-    <button id="history-btn" type="button" class="btn btn-ghost">History (<span id="history-count">0</span>)</button>
+  <div class="doodles" aria-hidden="true"></div>
+
+  <header class="hero">
+    <div class="hero-inner">
+      <p class="eyebrow">Bear-Light</p>
+      <h1>ILAW Drafting Assistant</h1>
+      <p class="hero-sub">Ang guro ang may-ari ng nilalaman. Kinukuha lang ng tool ang competency at objectives mula sa module mo, at inaayos ang mga sagot mo.</p>
+      <div id="provider-status" class="provider-status" role="status" aria-label="Estado ng AI providers"></div>
+    </div>
   </header>
 
-  <main class="wrap">
-    <section id="dll-form-container" class="card no-print">
-      <h2>Pormularyo ng Aralin</h2>
-      <div class="samples" id="samples"></div>
-      <form id="dll-form" novalidate>
-        <div class="grid4">
-          <label>Antas (Grade level) *<select id="gradeLevel"></select></label>
-          <label>Asignatura (Subject) *<select id="subjectArea"></select></label>
-          <label>Term<select id="quarter"><option>Term 1</option><option>Term 2</option><option>Term 3</option><option>Term 4</option></select></label>
-          <label>Week<select id="weekNumber"></select></label>
-        </div>
-        <label>Paksa / Competency *<textarea id="topic" rows="3" placeholder="Hal. Nauunawaan ang..."></textarea></label>
-        <label>Reference file (PDF, DOCX, PPTX, TXT — optional, max 20MB)<input type="file" id="refFile" accept=".pdf,.docx,.pptx,.txt,.md,.csv,.json"></label>
-        <p class="hint" id="refFileNote"></p>
-        <details>
-          <summary>Karagdagang detalye (school, teacher, atbp.)</summary>
-          <div class="grid2">
-            <label>Paaralan<input id="schoolName" placeholder="Pangalan ng paaralan"></label>
-            <label>Guro<input id="teacherName" placeholder="Pangalan ng guro"></label>
-            <label>Region<input id="region"></label>
-            <label>Division<input id="division"></label>
-            <label>Petsa ng pagtuturo<input id="teachingDates" placeholder="Hal. August 3 - 7, 2026"></label>
-            <label>Bilang ng sesyon<input id="noOfSessions" placeholder="Hal. 4 Sessions"></label>
+  <main>
+    <!-- 1. HEADER -->
+    <section class="card" id="card-header" aria-labelledby="h-header">
+      <div class="card-head"><span class="badge">1</span><h2 id="h-header">Header ng dokumento</h2></div>
+
+      <h3 class="sub-head">Letterhead (opsyonal)</h3>
+      <div class="grid">
+        <div class="logo-cell" data-side="left">
+          <span>Kaliwang logo</span>
+          <div class="logo-row">
+            <div class="logo-thumb"><img alt="Kaliwang logo" hidden><small>Walang logo</small></div>
+            <label class="btn soft file-btn">Pumili ng larawan<input type="file" class="sr-only" accept="image/png,image/jpeg,image/webp"></label>
+            <button type="button" class="btn ghost logo-remove" hidden>Alisin</button>
           </div>
-          <div class="grid2"><label>Logo 1 (kaliwa, hal. DepEd)<input type="file" id="leftLogo" accept="image/png,image/jpeg,image/gif"></label><label>Logo 2 (kanan, hal. paaralan)<input type="file" id="rightLogo" accept="image/png,image/jpeg,image/gif"></label></div>
-          <label>References<textarea id="references" rows="2"></textarea></label>
-          <label>Declaration of AI use<textarea id="declarationOfAiUse" rows="2"></textarea></label>
-        </details>
-        <p id="form-error" class="error" role="alert" hidden></p>
-        <button id="generate-btn" type="submit" class="btn btn-primary">Buuin ang DLL</button>
+        </div>
+        <div class="logo-cell" data-side="right">
+          <span>Kanang logo</span>
+          <div class="logo-row">
+            <div class="logo-thumb"><img alt="Kanang logo" hidden><small>Walang logo</small></div>
+            <label class="btn soft file-btn">Pumili ng larawan<input type="file" class="sr-only" accept="image/png,image/jpeg,image/webp"></label>
+            <button type="button" class="btn ghost logo-remove" hidden>Alisin</button>
+          </div>
+        </div>
+        <p class="hint cell full" id="logo-hint">PNG, JPG o WebP. Awtomatikong liliitan ang larawan para mabilis at magaan ang file.</p>
+        <p id="logo-err" class="error cell full" role="alert" hidden></p>
+        <label class="cell full"><span>School Name</span><input type="text" id="schoolName" autocomplete="organization" placeholder="hal. Castillejos National High School"></label>
+        <label class="cell"><span>Division</span><input type="text" id="division" placeholder="hal. Schools Division of Zambales"></label>
+        <label class="cell"><span>Region</span><input type="text" id="region" placeholder="hal. Region III – Central Luzon"></label>
+      </div>
+
+      <h3 class="sub-head">Detalye ng aralin</h3>
+      <div class="grid">
+        <label class="cell full"><span>Lesson Title</span><input type="text" id="lessonTitle" placeholder="Kung blangko, kukunin sa module"></label>
+        <label class="cell"><span>Learning Area/s *</span><input type="text" id="learningArea"></label>
+        <label class="cell"><span>Name of Teacher/s *</span><input type="text" id="teacherName" autocomplete="name"></label>
+        <label class="cell"><span>Grade Level and Section *</span><input type="text" id="gradeSection"></label>
+        <label class="cell"><span>No. of Sessions *</span><input type="text" id="noOfSessions" inputmode="numeric" placeholder="hal. 4"></label>
+        <label class="cell full"><span>Teaching Dates</span><input type="text" id="teachingDates" placeholder="hal. Nobyembre 3–7, 2026"></label>
+      </div>
+    </section>
+
+    <!-- 2. MODULE -->
+    <section class="card" id="card-module" aria-labelledby="h-module">
+      <div class="card-head"><span class="badge">2</span><h2 id="h-module">Module</h2></div>
+      <form id="form1" novalidate>
+        <div class="grid">
+          <label class="cell"><span>Format</span>
+            <select id="mode"><option value="weekly">Weekly (isang bloke para sa buong linggo)</option><option value="daily">Daily (Day 1 hanggang Day 5)</option></select>
+          </label>
+          <label class="cell"><span>Module / Instructional Material * (PDF, DOCX, PPTX, TXT, hanggang 20MB)</span>
+            <input type="file" id="moduleFile" accept=".pdf,.docx,.pptx,.txt,.md">
+          </label>
+        </div>
+        <p id="err1" class="error" role="alert" hidden></p>
+        <div class="row-actions"><button id="read-btn" type="submit" class="btn primary">Basahin ang module</button></div>
       </form>
     </section>
 
-    <section id="dll-output-container" class="card">
-      <div class="toolbar no-print">
-        <button id="edit-btn" type="button" class="btn btn-ghost">Edit</button>
-        <button id="copy-btn" type="button" class="btn btn-ghost">Copy text</button>
-        <button id="review-btn" type="button" class="btn btn-ghost">AI review</button>
-        <button id="docx-btn" type="button" class="btn btn-ghost">Download DOCX</button>
-        <button id="print-btn" type="button" class="btn btn-ghost">Print / PDF</button>
-        <button id="save-btn" type="button" class="btn btn-primary">I-save sa History</button>
-      </div>
-      <div id="preview"></div>
+    <!-- 3. CONFIRM -->
+    <section class="card" id="card-confirm" aria-labelledby="h-confirm" hidden>
+      <div class="card-head"><span class="badge">3</span><h2 id="h-confirm">Kumpirmahin ang mula sa module</h2></div>
+      <p class="hint">Eksaktong sipi ito mula sa module mo. Hindi ito isinulat ng AI. Pumili lang ng gagamitin. Sa Daily, lagyan ng tsek ang araw kung saan ito gagamitin.</p>
+      <p id="dropped" class="hint"></p>
+      <div id="candidates"></div>
+      <label class="check"><input type="checkbox" id="confirmBox"> Binasa ko ang mga napili at kinukumpirma kong tama ang mga ito.</label>
+      <p id="err2" class="error" role="alert" hidden></p>
+      <div class="row-actions"><button id="to-answers-btn" type="button" class="btn primary">Ituloy</button></div>
     </section>
+
+    <!-- 4. ANSWERS -->
+    <section class="card" id="card-answers" aria-labelledby="h-answers" hidden>
+      <div class="card-head"><span class="badge">4</span><h2 id="h-answers">Mga sagot mo</h2></div>
+      <p class="hint">Ikaw ang sumulat ng nilalaman. Aayusin lang ng AI ang pagkakasunod, linaw, at balarila. Ang iniwang blangko ay mananatiling blangko.</p>
+      <form id="form3" novalidate>
+        <div class="grid">
+          <label class="cell full"><span>Pre-Lesson: paano mo ihahanda ang mga mag-aaral?</span><textarea id="preLesson" rows="3"></textarea></label>
+          <div class="cell full">
+            <span>Flow: mga gawain bawat sesyon</span>
+            <div id="flow-list"></div>
+            <button id="add-session-btn" type="button" class="btn soft">+ Magdagdag ng sesyon</button>
+          </div>
+          <label class="cell full"><span>Learning Resources</span><textarea id="learningResources" rows="2" placeholder="Isama ang alternatibo kung sakaling magkaproblema"></textarea></label>
+          <label class="cell full"><span>Opportunities for integration</span><textarea id="integration" rows="2"></textarea></label>
+          <div class="cell full"><button id="na-btn" type="button" class="btn soft">Isulat ang N/A</button></div>
+          <label class="cell full"><span>Formative Assessment: gawain o tanong, paano hihingi ng tulong, at mga akomodasyon</span><textarea id="formative" rows="3"></textarea></label>
+          <label class="cell full"><span>Extended learning opportunities</span><textarea id="extendedLearning" rows="2"></textarea></label>
+          <label class="cell full"><span>Learner Context: obserbasyon mo sa mga mag-aaral (lakas, interes, hadlang)</span><textarea id="learnerContext" rows="3"></textarea></label>
+          <label class="cell full"><span>Reflections (opsyonal, isulat pagkatapos ng aralin)</span><textarea id="reflections" rows="2"></textarea></label>
+          <label class="cell full"><span>References (galing sa module; maaari mong baguhin)</span><textarea id="references" rows="2"></textarea></label>
+        </div>
+        <p id="err3" class="error" role="alert" hidden></p>
+        <div class="row-actions"><button id="draft-btn" type="submit" class="btn primary">Ayusin at suriin ang draft</button></div>
+      </form>
+    </section>
+
+    <p class="foot">Draft lang ito: kailangan ng review ng guro bago gamitin.</p>
   </main>
 
-  <aside id="history-drawer" class="drawer no-print" hidden>
-    <div class="drawer-head"><strong>Saved History</strong><button id="history-close" type="button" class="btn btn-ghost">Close</button></div>
-    <input id="history-search" type="search" placeholder="Search grade or subject">
-    <ul id="history-list"></ul>
-    <button id="history-clear" type="button" class="btn btn-ghost danger">Clear all</button>
-  </aside>
+  <div class="actionbar">
+    <div class="actionbar-inner">
+      <button type="button" id="clear-btn" class="btn ghost">Magsimulang muli</button>
+      <button type="button" id="open-draft-btn" class="btn primary" disabled>Buksan ang draft</button>
+    </div>
+  </div>
 
-  <footer class="foot no-print">© 2026 Bear-Light · DepEd MATATAG Lesson Log Generator</footer>
+  <!-- DRAFT OVERLAY -->
+  <div class="overlay" id="overlay" role="dialog" aria-modal="true" aria-labelledby="overlay-title" hidden>
+    <div class="overlay-bar">
+      <h2 id="overlay-title">Draft ng ILAW</h2>
+      <div class="overlay-actions">
+        <button type="button" id="edit-btn" class="btn soft">Edit</button>
+        <button type="button" id="copy-btn" class="btn soft">Copy text</button>
+        <button type="button" id="review-btn" class="btn soft">AI review</button>
+        <button type="button" id="export-docx-btn" class="btn primary">Export DOCX</button>
+        <button type="button" id="print-btn" class="btn soft">Print / PDF</button>
+        <button type="button" id="close-btn" class="btn ghost">Isara ✕</button>
+      </div>
+    </div>
+    <p id="err4" class="status error" role="alert" hidden></p>
+    <div class="overlay-scroll">
+      <div id="preview-notes"></div>
+      <article class="paper" id="print-doc"></article>
+    </div>
+  </div>
+
   <script type="module" src="js/main.js"></script>
 </body>
 </html>

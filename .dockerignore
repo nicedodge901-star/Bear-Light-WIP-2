@@ -1,0 +1,7 @@
+.git
+.env*
+**/__pycache__
+**/.pytest_cache
+backend/logs
+backend/test_*.py
+README.md
