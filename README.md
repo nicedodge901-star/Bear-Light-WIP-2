@@ -2,7 +2,7 @@
 
 A drafting assistant for DepEd teachers writing **ILAW lesson plans**. The teacher writes the lesson. The AI only reads the module, tidies the order and grammar, and a rule-based checker flags what's missing.
 
-**Live app:** [YOUR-RENDER-URL](https://YOUR-RENDER-URL.onrender.com) *(free hosting: if it's asleep, wait about a minute for it to wake up)*
+**Live app:** [YOUR-RENDER-URL]((https://bear-light.onrender.com/)) *(free hosting: if it's asleep, wait about a minute for it to wake up)*
 
 ![Bear-Light home page](docs/screenshot-home.png)
 
